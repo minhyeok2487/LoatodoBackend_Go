@@ -48,6 +48,7 @@ func main() {
 
 	// 4. Create Lostark API clients
 	lostarkClient := client.NewLostarkClient()
+	charClient := client.NewLostarkCharacterClient(lostarkClient)
 	marketClient := client.NewLostarkMarketClient(lostarkClient)
 
 	// 5. Create Discord webhook
@@ -59,8 +60,8 @@ func main() {
 
 	// 6. Create services
 	authService := service.NewAuthService(db, tp)
-	memberService := service.NewMemberService(db)
-	characterService := service.NewCharacterService(db)
+	memberService := service.NewMemberService(db, charClient, lostarkClient)
+	characterService := service.NewCharacterService(db, charClient)
 	characterDayService := service.NewCharacterDayService(db)
 	characterWeekService := service.NewCharacterWeekService(db)
 	friendService := service.NewFriendService(db)

@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"lostark-todo-backend/internal/client"
 )
 
 // CharacterService handles character-related business logic.
 type CharacterService struct {
-	db *sql.DB
+	db         *sql.DB
+	charClient *client.LostarkCharacterClient
 }
 
 // NewCharacterService creates a new CharacterService.
-func NewCharacterService(db *sql.DB) *CharacterService {
-	return &CharacterService{db: db}
+func NewCharacterService(db *sql.DB, charClient *client.LostarkCharacterClient) *CharacterService {
+	return &CharacterService{db: db, charClient: charClient}
 }
 
 // UpdateSettingsRequest is the request to update character display settings.
@@ -220,28 +223,100 @@ func (s *CharacterService) UpdateSingleCharacter(ctx context.Context, username s
 		return nil, err
 	}
 
-	// TODO: Call Lostark API to fetch updated character info
-	// For now, return existing character data
+	// Get member's API key
+	var apiKey sql.NullString
+	err = s.db.QueryRowContext(ctx,
+		"SELECT api_key FROM member WHERE id = ?", char.MemberID,
+	).Scan(&apiKey)
+	if err != nil {
+		return nil, fmt.Errorf("querying member api key: %w", err)
+	}
+	if !apiKey.Valid || apiKey.String == "" {
+		return nil, errors.New("API Key가 등록되지 않았습니다.")
+	}
+
+	// Fetch profile from Lostark API
+	profile, err := s.charClient.GetCharacterProfile(char.CharacterName, apiKey.String)
+	if err != nil {
+		return nil, fmt.Errorf("fetching character profile: %w", err)
+	}
+
+	// Parse updated values
+	itemLevel := char.ItemLevel
+	if profile.ItemAvgLevel != "" {
+		parsed, _ := (&client.CharacterJsonDto{ItemAvgLevel: profile.ItemAvgLevel}).ParseItemLevel()
+		if parsed >= 1415.0 {
+			itemLevel = parsed
+		}
+	}
+
+	var combatPower sql.NullFloat64
+	if profile.CombatPower != "" {
+		cp, _ := (&client.CharacterJsonDto{CombatPower: profile.CombatPower}).ParseCombatPower()
+		if cp > 0 {
+			combatPower = sql.NullFloat64{Float64: cp, Valid: true}
+		}
+	}
+
+	var charImage sql.NullString
+	if profile.CharacterImage != nil {
+		charImage = sql.NullString{String: *profile.CharacterImage, Valid: true}
+	}
+
+	// Find appropriate content IDs based on new item level
+	var chaosID, guardianID sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM content WHERE dtype = 'DayContent' AND category = '카오스던전' AND level <= ? ORDER BY level DESC LIMIT 1`,
+		itemLevel,
+	).Scan(&chaosID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("querying chaos content: %w", err)
+	}
+	err = s.db.QueryRowContext(ctx,
+		`SELECT id FROM content WHERE dtype = 'DayContent' AND category = '가디언토벌' AND level <= ? ORDER BY level DESC LIMIT 1`,
+		itemLevel,
+	).Scan(&guardianID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("querying guardian content: %w", err)
+	}
+
+	// Update character in DB
+	now := time.Now()
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE character_entity SET
+			character_name = ?, character_level = ?, character_class_name = ?,
+			character_image = ?, item_level = ?, combat_power = ?,
+			server_name = ?, chaos_id = ?, guardian_id = ?,
+			last_modified_date = ?
+		 WHERE id = ?`,
+		profile.CharacterName, profile.CharacterLevel, profile.CharacterClassName,
+		charImage, itemLevel, combatPower,
+		profile.ServerName, chaosID, guardianID,
+		now, char.ID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("updating character: %w", err)
+	}
+
 	resp := &CharacterResponse{
-		ID:                 char.ID,
-		ServerName:         char.ServerName,
-		CharacterName:      char.CharacterName,
-		CharacterLevel:     char.CharacterLevel,
-		CharacterClassName: char.CharacterClassName,
-		ItemLevel:          char.ItemLevel,
+		CharacterID:        char.ID,
+		ServerName:         profile.ServerName,
+		CharacterName:      profile.CharacterName,
+		CharacterClassName: profile.CharacterClassName,
+		ItemLevel:          itemLevel,
 		SortNumber:         char.SortNumber,
 		GoldCharacter:      char.GoldCharacter,
 		ChallengeGuardian:  char.ChallengeGuardian,
 		ChallengeAbyss:     char.ChallengeAbyss,
 	}
-	if char.CharacterImage.Valid {
-		resp.CharacterImage = &char.CharacterImage.String
+	if charImage.Valid {
+		resp.CharacterImage = &charImage.String
 	}
 	if char.Memo.Valid {
 		resp.Memo = &char.Memo.String
 	}
-	if char.CombatPower.Valid {
-		resp.CombatPower = char.CombatPower.Float64
+	if combatPower.Valid {
+		resp.CombatPower = combatPower.Float64
 	}
 	return resp, nil
 }
@@ -297,7 +372,7 @@ func (s *CharacterService) AddCharacter(ctx context.Context, username string, re
 
 	id, _ := result.LastInsertId()
 	return &CharacterResponse{
-		ID:            id,
+		CharacterID:   id,
 		CharacterName: req.CharacterName,
 		SortNumber:    nextSort,
 	}, nil
@@ -314,22 +389,29 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.id, c.server_name, c.character_name, c.character_level,
+		`SELECT c.id, c.member_id, c.server_name, c.character_name,
 		        c.character_class_name, c.character_image, c.item_level,
 		        c.combat_power, c.sort_number, c.memo, c.gold_character,
 		        c.challenge_guardian, c.challenge_abyss,
 		        COALESCE(c.chaos_check, 0), COALESCE(c.chaos_gauge, 0), COALESCE(c.chaos_gold, 0),
 		        COALESCE(c.guardian_check, 0), COALESCE(c.guardian_gauge, 0), COALESCE(c.guardian_gold, 0),
-		        COALESCE(c.epona_check, 0), COALESCE(c.epona_gauge, 0),
+		        COALESCE(c.epona_check2, 0), COALESCE(c.epona_gauge, 0),
 		        COALESCE(c.week_total_gold, 0),
-		        COALESCE(c.week_epona, 0), COALESCE(c.week_epona_check, false),
-		        COALESCE(c.silmael_exchange, false), COALESCE(c.cube_ticket, 0),
-		        COALESCE(c.gold_check_version, 0),
-		        COALESCE(c.elysian_count, 0), COALESCE(c.elysian_all_check, false),
-		        COALESCE(c.show_character, true), COALESCE(c.show_chaos, true),
-		        COALESCE(c.show_guardian, true), COALESCE(c.show_epona, true),
-		        COALESCE(c.show_week_epona, true), COALESCE(c.show_silmael, true),
-		        COALESCE(c.show_cube, true)
+		        COALESCE(c.week_epona, 0),
+		        COALESCE(c.silmael_change, false), COALESCE(c.cube_ticket, 0),
+		        COALESCE(c.elysian_count, 0),
+		        COALESCE(c.before_epona_gauge, 0), COALESCE(c.before_chaos_gauge, 0),
+		        COALESCE(c.before_guardian_gauge, 0),
+		        COALESCE(c.show_character, true), COALESCE(c.show_epona, true),
+		        COALESCE(c.threshold_epona, 0),
+		        COALESCE(c.show_chaos, true), COALESCE(c.threshold_chaos, 0),
+		        COALESCE(c.show_guardian, true), COALESCE(c.threshold_guardian, 0),
+		        COALESCE(c.show_week_todo, true), COALESCE(c.show_week_epona, true),
+		        COALESCE(c.show_silmael_change, true), COALESCE(c.show_cube_ticket, true),
+		        COALESCE(c.gold_check_version, false),
+		        COALESCE(c.gold_check_policy_enum, 'TOP_THREE_POLICY'),
+		        COALESCE(c.link_cube_cal, false), COALESCE(c.show_more_button, true),
+		        COALESCE(c.show_elysian, true)
 		 FROM character_entity c
 		 WHERE c.member_id = ? AND (c.deleted IS NULL OR c.deleted = false)
 		 ORDER BY c.sort_number ASC`, memberID,
@@ -345,22 +427,29 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		var image, memo sql.NullString
 		var combatPower sql.NullFloat64
 		err := rows.Scan(
-			&c.ID, &c.ServerName, &c.CharacterName, &c.CharacterLevel,
+			&c.CharacterID, &c.MemberID, &c.ServerName, &c.CharacterName,
 			&c.CharacterClassName, &image, &c.ItemLevel,
 			&combatPower, &c.SortNumber, &memo, &c.GoldCharacter,
 			&c.ChallengeGuardian, &c.ChallengeAbyss,
-			&c.DayTodo.ChaosCheck, &c.DayTodo.ChaosGauge, &c.DayTodo.ChaosGold,
-			&c.DayTodo.GuardianCheck, &c.DayTodo.GuardianGauge, &c.DayTodo.GuardianGold,
-			&c.DayTodo.EponaCheck, &c.DayTodo.EponaGauge,
-			&c.DayTodo.WeekTotalGold,
-			&c.WeekTodo.WeekEpona, &c.WeekTodo.WeekEponaCheck,
-			&c.WeekTodo.SilmaelExchange, &c.WeekTodo.CubeTicket,
-			&c.WeekTodo.GoldCheckVersion,
-			&c.WeekTodo.ElysianCount, &c.WeekTodo.ElysianAllCheck,
-			&c.Settings.ShowCharacter, &c.Settings.ShowChaos,
-			&c.Settings.ShowGuardian, &c.Settings.ShowEpona,
-			&c.Settings.ShowWeekEpona, &c.Settings.ShowSilmael,
-			&c.Settings.ShowCube,
+			&c.ChaosCheck, &c.ChaosGauge, &c.ChaosGold,
+			&c.GuardianCheck, &c.GuardianGauge, &c.GuardianGold,
+			&c.EponaCheck, &c.EponaGauge,
+			&c.WeekDayTodoGold,
+			&c.WeekEpona,
+			&c.SilmaelChange, &c.CubeTicket,
+			&c.ElysianCount,
+			&c.BeforeEponaGauge, &c.BeforeChaosGauge,
+			&c.BeforeGuardianGauge,
+			&c.Settings.ShowCharacter, &c.Settings.ShowEpona,
+			&c.Settings.ThresholdEpona,
+			&c.Settings.ShowChaos, &c.Settings.ThresholdChaos,
+			&c.Settings.ShowGuardian, &c.Settings.ThresholdGuardian,
+			&c.Settings.ShowWeekTodo, &c.Settings.ShowWeekEpona,
+			&c.Settings.ShowSilmaelChange, &c.Settings.ShowCubeTicket,
+			&c.Settings.GoldCheckVersion,
+			&c.Settings.GoldCheckPolicyEnum,
+			&c.Settings.LinkCubeCal, &c.Settings.ShowMoreButton,
+			&c.Settings.ShowElysian,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning character: %w", err)
@@ -376,18 +465,21 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		}
 
 		// Load TodoV2 (raid) list for this character
-		todoList, err := s.getTodoV2List(ctx, c.ID)
+		todoList, err := s.buildTodoList(ctx, c.CharacterID, c.CharacterClassName, c.GoldCharacter, c.Settings.GoldCheckPolicyEnum)
 		if err != nil {
 			return nil, err
 		}
-		c.TodoV2List = todoList
+		c.TodoList = todoList
 
-		// Load bus gold list
-		busGoldList, err := s.getRaidBusGoldList(ctx, c.ID)
+		// Load bus gold list (internal use for gold calc)
+		busGoldList, err := s.getRaidBusGoldList(ctx, c.CharacterID)
 		if err != nil {
 			return nil, err
 		}
 		c.RaidBusGoldList = busGoldList
+
+		// Calculate week raid gold from todo list
+		s.calculateWeekRaidGold(&c)
 
 		characters = append(characters, c)
 	}
@@ -409,7 +501,7 @@ func (s *CharacterService) GetDeletedCharacters(ctx context.Context, username st
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT c.id, c.server_name, c.character_name, c.character_level,
+		`SELECT c.id, c.server_name, c.character_name,
 		        c.character_class_name, c.character_image, c.item_level,
 		        c.combat_power, c.sort_number, c.memo, c.gold_character,
 		        c.challenge_guardian, c.challenge_abyss
@@ -428,7 +520,7 @@ func (s *CharacterService) GetDeletedCharacters(ctx context.Context, username st
 		var image, memo sql.NullString
 		var combatPower sql.NullFloat64
 		err := rows.Scan(
-			&c.ID, &c.ServerName, &c.CharacterName, &c.CharacterLevel,
+			&c.CharacterID, &c.ServerName, &c.CharacterName,
 			&c.CharacterClassName, &image, &c.ItemLevel,
 			&combatPower, &c.SortNumber, &memo, &c.GoldCharacter,
 			&c.ChallengeGuardian, &c.ChallengeAbyss,
@@ -495,33 +587,56 @@ func (s *CharacterService) UpdateCharacterSorting(ctx context.Context, username 
 	return tx.Commit()
 }
 
-// getTodoV2List returns the raid/weekly todo list for a character.
-func (s *CharacterService) getTodoV2List(ctx context.Context, characterID int64) ([]TodoV2Response, error) {
+// todoV2Row is an internal representation of a single todo_v2 DB row.
+type todoV2Row struct {
+	ID                  int64
+	WeekCategory        string
+	WeekContentCategory string
+	Gate                int
+	Gold                int
+	CharacterGold       int
+	GoldCheck           bool
+	IsChecked           bool
+	SortNumber          int
+	Message             *string
+	CoolTime            int
+	MoreRewardCheck     bool
+	MoreRewardGold      int
+}
+
+// buildTodoList loads TodoV2 rows and groups them into TodoResponseDto list (matching Spring Boot).
+func (s *CharacterService) buildTodoList(ctx context.Context, characterID int64, charClassName string, goldCharacter bool, goldPolicy string) ([]TodoResponseDto, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT t.id, t.week_category, t.week_content_name, COALESCE(t.week_content_gate, 0),
-		        COALESCE(t.gold, 0), COALESCE(t.gold_check, false), COALESCE(t.is_checked, false),
+		`SELECT t.id, t.week_category,
+		        COALESCE(wc.week_content_category, ''),
+		        COALESCE(wc.gate, 0),
+		        COALESCE(wc.gold, 0), COALESCE(wc.character_gold, 0),
+		        COALESCE(t.gold_check, false), COALESCE(t.is_checked, false),
 		        COALESCE(t.sort_number, 0), t.message,
-		        COALESCE(t.current_gate, 0), COALESCE(t.total_gate, 0),
-		        COALESCE(t.more_reward, false), COALESCE(t.more_reward_gold, 0)
+		        COALESCE(t.cool_time, 1),
+		        COALESCE(t.more_reward_check, false), COALESCE(wc.more_reward_gold, 0)
 		 FROM todo_v2 t
-		 WHERE t.character_id = ?
-		 ORDER BY t.sort_number ASC`, characterID,
+		 LEFT JOIN content wc ON t.week_content_id = wc.content_id
+		 WHERE t.character_id = ? AND COALESCE(t.cool_time, 1) >= 1
+		 ORDER BY COALESCE(wc.gate, 0) ASC`, characterID,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("querying todo_v2: %w", err)
 	}
 	defer rows.Close()
 
-	var todos []TodoV2Response
+	var todoRows []todoV2Row
 	for rows.Next() {
-		var t TodoV2Response
+		var t todoV2Row
 		var message sql.NullString
 		err := rows.Scan(
-			&t.ID, &t.WeekCategory, &t.WeekContentName, &t.WeekContentGate,
-			&t.Gold, &t.GoldCheck, &t.Check,
+			&t.ID, &t.WeekCategory,
+			&t.WeekContentCategory, &t.Gate,
+			&t.Gold, &t.CharacterGold,
+			&t.GoldCheck, &t.IsChecked,
 			&t.SortNumber, &message,
-			&t.CurrentGate, &t.TotalGate,
-			&t.MoreReward, &t.MoreRewardGold,
+			&t.CoolTime,
+			&t.MoreRewardCheck, &t.MoreRewardGold,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning todo_v2: %w", err)
@@ -529,13 +644,133 @@ func (s *CharacterService) getTodoV2List(ctx context.Context, characterID int64)
 		if message.Valid {
 			t.Message = &message.String
 		}
-		todos = append(todos, t)
+		todoRows = append(todoRows, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
-	if todos == nil {
-		todos = []TodoV2Response{}
+	// Group by weekCategory into TodoResponseDto (matching Spring Boot grouping logic)
+	dtoMap := make(map[string]*TodoResponseDto)
+	var dtoOrder []string
+
+	for _, t := range todoRows {
+		existing, ok := dtoMap[t.WeekCategory]
+		if !ok {
+			realGold := 0
+			charGold := 0
+			if goldCharacter {
+				realGold = t.Gold
+				if t.MoreRewardCheck && t.CharacterGold == 0 {
+					realGold -= t.MoreRewardGold
+				}
+				if t.CharacterGold != 0 {
+					charGold = t.CharacterGold
+					if t.MoreRewardCheck {
+						charGold -= t.MoreRewardGold
+					}
+				}
+			}
+			dto := &TodoResponseDto{
+				ID:                  t.ID,
+				WeekCategory:        t.WeekCategory,
+				WeekContentCategory: t.WeekContentCategory,
+				Gold:                t.Gold,
+				RealGold:            realGold,
+				GoldCheck:           t.GoldCheck,
+				Message:             t.Message,
+				CurrentGate:         0,
+				TotalGate:           t.Gate,
+				SortNumber:          t.SortNumber,
+				CharacterClassName:  charClassName,
+				MoreRewardCheckList: []bool{t.MoreRewardCheck},
+				MoreRewardGoldList:  []int{t.MoreRewardGold},
+				CharacterGold:       charGold,
+			}
+			if t.IsChecked {
+				dto.CurrentGate = t.Gate
+			}
+			dtoMap[t.WeekCategory] = dto
+			dtoOrder = append(dtoOrder, t.WeekCategory)
+		} else {
+			// Merge into existing entry (multi-gate raid)
+			existing.Gold += t.Gold
+			existing.TotalGate = t.Gate
+			existing.MoreRewardCheckList = append(existing.MoreRewardCheckList, t.MoreRewardCheck)
+			existing.MoreRewardGoldList = append(existing.MoreRewardGoldList, t.MoreRewardGold)
+
+			if goldCharacter {
+				addRealGold := t.Gold
+				if t.MoreRewardCheck && t.CharacterGold == 0 {
+					addRealGold -= t.MoreRewardGold
+				}
+				existing.RealGold += addRealGold
+				if t.CharacterGold != 0 {
+					addCharGold := t.CharacterGold
+					if t.MoreRewardCheck {
+						addCharGold -= t.MoreRewardGold
+					}
+					existing.CharacterGold += addCharGold
+				}
+			}
+
+			if t.IsChecked {
+				existing.CurrentGate = t.Gate
+			}
+		}
 	}
-	return todos, rows.Err()
+
+	// Apply RAID_CHECK_POLICY if applicable
+	if goldPolicy == "RAID_CHECK_POLICY" {
+		for _, dto := range dtoMap {
+			dto.RealGold -= dto.Gold
+		}
+	}
+
+	// Build result in order, mark completed
+	result := make([]TodoResponseDto, 0, len(dtoOrder))
+	for _, cat := range dtoOrder {
+		dto := dtoMap[cat]
+		if dto.CurrentGate == dto.TotalGate {
+			dto.Check = true
+		}
+		result = append(result, *dto)
+	}
+
+	if result == nil {
+		result = []TodoResponseDto{}
+	}
+	return result, nil
+}
+
+// calculateWeekRaidGold calculates the weekly raid gold for a character response.
+func (s *CharacterService) calculateWeekRaidGold(c *CharacterResponse) {
+	if !c.GoldCharacter || len(c.TodoList) == 0 {
+		return
+	}
+
+	for i := range c.TodoList {
+		todo := &c.TodoList[i]
+		if todo.Check && todo.GoldCheck {
+			c.WeekRaidGold += todo.RealGold
+			c.WeekCharacterRaidGold += todo.CharacterGold
+		}
+	}
+
+	// Apply bus gold
+	busMap := make(map[string]float64)
+	for _, bg := range c.RaidBusGoldList {
+		busMap[bg.WeekCategory] = bg.BusGold
+	}
+	for i := range c.TodoList {
+		todo := &c.TodoList[i]
+		if busGold, ok := busMap[todo.WeekCategory]; ok {
+			todo.RealGold += int(busGold)
+			if todo.Check {
+				c.WeekRaidGold += int(busGold)
+			}
+		}
+	}
 }
 
 // getRaidBusGoldList returns the bus gold list for a character.

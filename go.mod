@@ -13,4 +13,7 @@ require (
 	golang.org/x/time v0.5.0
 )
 
-require filippo.io/edwards25519 v1.1.0 // indirect
+require (
+	cloud.google.com/go/compute/metadata v0.3.0 // indirect
+	filippo.io/edwards25519 v1.1.0 // indirect
+)

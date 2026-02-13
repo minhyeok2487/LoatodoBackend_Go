@@ -387,7 +387,7 @@ func (s *CharacterWeekService) ToggleSilmael(ctx context.Context, username strin
 
 	_, err = s.db.ExecContext(ctx,
 		`UPDATE character_entity
-		 SET silmael_exchange = NOT COALESCE(silmael_exchange, false),
+		 SET silmael_change = NOT COALESCE(silmael_change, false),
 		     last_modified_date = ?
 		 WHERE id = ?`,
 		time.Now(), req.CharacterID,

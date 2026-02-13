@@ -42,7 +42,19 @@ func (h *MemberHandler) SaveCharacter(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.memberService.SaveCharacter(r.Context(), username); err != nil {
+	var req struct {
+		CharacterName string `json:"characterName"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "잘못된 요청입니다.")
+		return
+	}
+	if req.CharacterName == "" {
+		writeError(w, http.StatusBadRequest, "캐릭터명을 입력해주세요.")
+		return
+	}
+
+	if err := h.memberService.SaveCharacter(r.Context(), username, req.CharacterName); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}

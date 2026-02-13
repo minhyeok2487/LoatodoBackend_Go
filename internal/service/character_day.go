@@ -18,6 +18,19 @@ func NewCharacterDayService(db *sql.DB) *CharacterDayService {
 	return &CharacterDayService{db: db}
 }
 
+// DayTodoResult is the internal response for day todo operations.
+type DayTodoResult struct {
+	ChaosCheck    int     `json:"chaosCheck"`
+	ChaosGauge    int     `json:"chaosGauge"`
+	ChaosGold     float64 `json:"chaosGold"`
+	GuardianCheck int     `json:"guardianCheck"`
+	GuardianGauge int     `json:"guardianGauge"`
+	GuardianGold  float64 `json:"guardianGold"`
+	EponaCheck    int     `json:"eponaCheck"`
+	EponaGauge    int     `json:"eponaGauge"`
+	WeekTotalGold float64 `json:"weekDayTodoGold"`
+}
+
 // DayCheckRequest is the request for checking daily content.
 type DayCheckRequest struct {
 	CharacterID int64  `json:"characterId"`
@@ -67,7 +80,7 @@ func (s *CharacterDayService) loadDayTodo(ctx context.Context, characterID int64
 		        COALESCE(before_chaos_gauge, 0), COALESCE(chaos_gold, 0),
 		        COALESCE(guardian_check, 0), COALESCE(guardian_gauge, 0),
 		        COALESCE(before_guardian_gauge, 0), COALESCE(guardian_gold, 0),
-		        COALESCE(epona_check, 0), COALESCE(epona_gauge, 0),
+		        COALESCE(epona_check2, 0), COALESCE(epona_gauge, 0),
 		        COALESCE(before_epona_gauge, 0),
 		        COALESCE(week_total_gold, 0)
 		 FROM character_entity WHERE id = ?`, characterID,
@@ -105,7 +118,7 @@ func (s *CharacterDayService) verifyOwnership(ctx context.Context, username stri
 }
 
 // CheckDayContent checks a specific daily content (chaos/guardian/epona).
-func (s *CharacterDayService) CheckDayContent(ctx context.Context, username string, req DayCheckRequest) (*DayTodoResponse, error) {
+func (s *CharacterDayService) CheckDayContent(ctx context.Context, username string, req DayCheckRequest) (*DayTodoResult, error) {
 	d, err := s.loadDayTodo(ctx, req.CharacterID)
 	if err != nil {
 		return nil, err
@@ -138,7 +151,7 @@ func (s *CharacterDayService) CheckDayContent(ctx context.Context, username stri
 		`UPDATE character_entity
 		 SET chaos_check = ?, chaos_gauge = ?,
 		     guardian_check = ?, guardian_gauge = ?,
-		     epona_check = ?, epona_gauge = ?,
+		     epona_check2 = ?, epona_gauge = ?,
 		     week_total_gold = ?, last_modified_date = ?
 		 WHERE id = ?`,
 		d.ChaosCheck, d.ChaosGauge,
@@ -150,7 +163,7 @@ func (s *CharacterDayService) CheckDayContent(ctx context.Context, username stri
 		return nil, fmt.Errorf("updating day content: %w", err)
 	}
 
-	return &DayTodoResponse{
+	return &DayTodoResult{
 		ChaosCheck:    d.ChaosCheck,
 		ChaosGauge:    d.ChaosGauge,
 		ChaosGold:     d.ChaosGold,
@@ -188,7 +201,7 @@ func (s *CharacterDayService) UpdateGauge(ctx context.Context, username string, 
 }
 
 // CheckAllDayContent checks all daily content for a single character.
-func (s *CharacterDayService) CheckAllDayContent(ctx context.Context, username string, req DayCheckAllRequest) (*DayTodoResponse, error) {
+func (s *CharacterDayService) CheckAllDayContent(ctx context.Context, username string, req DayCheckAllRequest) (*DayTodoResult, error) {
 	d, err := s.loadDayTodo(ctx, req.CharacterID)
 	if err != nil {
 		return nil, err
@@ -225,7 +238,7 @@ func (s *CharacterDayService) CheckAllDayContent(ctx context.Context, username s
 		`UPDATE character_entity
 		 SET chaos_check = ?, chaos_gauge = ?,
 		     guardian_check = ?, guardian_gauge = ?,
-		     epona_check = ?, epona_gauge = ?,
+		     epona_check2 = ?, epona_gauge = ?,
 		     week_total_gold = ?, last_modified_date = ?
 		 WHERE id = ?`,
 		d.ChaosCheck, d.ChaosGauge,
@@ -237,7 +250,7 @@ func (s *CharacterDayService) CheckAllDayContent(ctx context.Context, username s
 		return nil, fmt.Errorf("updating all day content: %w", err)
 	}
 
-	return &DayTodoResponse{
+	return &DayTodoResult{
 		ChaosCheck:    d.ChaosCheck,
 		ChaosGauge:    d.ChaosGauge,
 		ChaosGold:     d.ChaosGold,
