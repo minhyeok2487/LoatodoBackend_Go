@@ -2,6 +2,7 @@ package handler
 
 import (
 	"net/http"
+	"os"
 
 	"lostark-todo-backend/internal/service"
 )
@@ -14,8 +15,22 @@ func NewMyGameHandler(svc *service.MyGameService) *MyGameHandler {
 	return &MyGameHandler{svc: svc}
 }
 
+// validateAPIKey checks the X-API-Key header matches the configured API key
+func (h *MyGameHandler) validateAPIKey(r *http.Request) bool {
+	apiKey := r.Header.Get("X-API-Key")
+	expectedKey := os.Getenv("MYGAME_API_KEY")
+	if expectedKey == "" {
+		expectedKey = "mygame-secret-key" // default for development
+	}
+	return apiKey != "" && apiKey == expectedKey
+}
+
 // ListGames handles GET /api/v1/games (with search, page, limit query params)
 func (h *MyGameHandler) ListGames(w http.ResponseWriter, r *http.Request) {
+	if !h.validateAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: "유효하지 않은 API Key입니다."}})
+		return
+	}
 	search := getQueryParam(r, "search")
 	page := parseIntParam(getQueryParam(r, "page"))
 	limit := parseIntParam(getQueryParam(r, "limit"))
@@ -36,6 +51,10 @@ func (h *MyGameHandler) ListGames(w http.ResponseWriter, r *http.Request) {
 
 // GetGame handles GET /api/v1/games/{id}
 func (h *MyGameHandler) GetGame(w http.ResponseWriter, r *http.Request) {
+	if !h.validateAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: "유효하지 않은 API Key입니다."}})
+		return
+	}
 	gameID := parseInt64Param(getPathParam(r, "id"))
 	result, err := h.svc.GetGameById(r.Context(), gameID)
 	if err != nil {
@@ -47,6 +66,10 @@ func (h *MyGameHandler) GetGame(w http.ResponseWriter, r *http.Request) {
 
 // GetAllGames handles GET /api/v1/games/all
 func (h *MyGameHandler) GetAllGames(w http.ResponseWriter, r *http.Request) {
+	if !h.validateAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: "유효하지 않은 API Key입니다."}})
+		return
+	}
 	result, err := h.svc.GetAllGames(r.Context())
 	if err != nil {
 		writeJSON(w, http.StatusOK, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: err.Error()}})
@@ -72,6 +95,10 @@ func (h *MyGameHandler) CreateGame(w http.ResponseWriter, r *http.Request) {
 
 // ListEvents handles GET /api/v1/events (with filters)
 func (h *MyGameHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
+	if !h.validateAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: "유효하지 않은 API Key입니다."}})
+		return
+	}
 	gameIds := getQueryParam(r, "gameIds")
 	startDate := getQueryParam(r, "startDate")
 	endDate := getQueryParam(r, "endDate")
@@ -95,6 +122,10 @@ func (h *MyGameHandler) ListEvents(w http.ResponseWriter, r *http.Request) {
 
 // GetEvent handles GET /api/v1/events/{id}
 func (h *MyGameHandler) GetEvent(w http.ResponseWriter, r *http.Request) {
+	if !h.validateAPIKey(r) {
+		writeJSON(w, http.StatusUnauthorized, &service.ApiResponseWrapper{Success: false, Error: &service.ErrorWrapper{Message: "유효하지 않은 API Key입니다."}})
+		return
+	}
 	eventID := parseInt64Param(getPathParam(r, "id"))
 	result, err := h.svc.GetEventById(r.Context(), eventID)
 	if err != nil {

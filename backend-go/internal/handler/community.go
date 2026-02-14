@@ -19,6 +19,17 @@ func NewCommunityHandler(svc *service.CommunityService) *CommunityHandler {
 func (h *CommunityHandler) ListPosts(w http.ResponseWriter, r *http.Request) {
 	username := auth.GetUsername(r)
 	category := getQueryParam(r, "category")
+
+	// Validate category (Spring requires valid category)
+	validCategories := map[string]bool{
+		"일상": true, "깐부모집": true, "길드모집": true,
+		"고정팟모집": true, "로투두공지": true, "로투두건의사항": true,
+	}
+	if category == "" || !validCategories[category] {
+		writeError(w, http.StatusBadRequest, "유효하지 않은 카테고리입니다")
+		return
+	}
+
 	page := parseIntParam(getQueryParam(r, "page"))
 	size := parseIntParam(getQueryParam(r, "size"))
 	if size <= 0 {
