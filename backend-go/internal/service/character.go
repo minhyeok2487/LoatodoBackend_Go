@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"lostark-todo-backend/internal/client"
@@ -14,11 +15,21 @@ import (
 type CharacterService struct {
 	db         *sql.DB
 	charClient *client.LostarkCharacterClient
+
+	// Global cache for day content (chaos/guardian)
+	dayContentCache     map[string][]DayContentResponse // category -> sorted by level DESC
+	dayContentCacheMu   sync.RWMutex
+	dayContentCacheTime time.Time
 }
 
 // NewCharacterService creates a new CharacterService.
 func NewCharacterService(db *sql.DB, charClient *client.LostarkCharacterClient) *CharacterService {
-	return &CharacterService{db: db, charClient: charClient}
+	svc := &CharacterService{
+		db:              db,
+		charClient:      charClient,
+		dayContentCache: make(map[string][]DayContentResponse),
+	}
+	return svc
 }
 
 // UpdateSettingsRequest is the request to update character display settings.
@@ -661,6 +672,9 @@ func (s *CharacterService) AddCharacter(ctx context.Context, username string, re
 // GetCharacterList returns the full character list with todo info for a member.
 // Optimized to use batch queries instead of N+1 queries.
 func (s *CharacterService) GetCharacterList(ctx context.Context, username string) ([]CharacterResponse, error) {
+	// Preload day content cache (only loads if cache is empty or expired)
+	_ = s.loadDayContentCache(ctx)
+
 	var memberID int64
 	err := s.db.QueryRowContext(ctx,
 		"SELECT member_id FROM member WHERE username = ?", username,
@@ -771,9 +785,6 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		return nil, err
 	}
 
-	// Cache day content by item level to avoid duplicate queries
-	dayContentCache := make(map[string]*DayContentResponse)
-
 	// Assign data to each character
 	for i := range characters {
 		c := &characters[i]
@@ -783,22 +794,9 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 			c.TodoList = s.processTodoList(todos, c.CharacterClassName, c.GoldCharacter, c.Settings.GoldCheckPolicyEnum)
 		}
 
-		// Load chaos/guardian content with caching
-		chaosKey := fmt.Sprintf("카오스던전_%.0f", c.ItemLevel)
-		if cached, ok := dayContentCache[chaosKey]; ok {
-			c.Chaos = cached
-		} else {
-			c.Chaos = s.getDayContent(ctx, "카오스던전", c.ItemLevel)
-			dayContentCache[chaosKey] = c.Chaos
-		}
-
-		guardianKey := fmt.Sprintf("가디언토벌_%.0f", c.ItemLevel)
-		if cached, ok := dayContentCache[guardianKey]; ok {
-			c.Guardian = cached
-		} else {
-			c.Guardian = s.getDayContent(ctx, "가디언토벌", c.ItemLevel)
-			dayContentCache[guardianKey] = c.Guardian
-		}
+		// Load chaos/guardian content from global cache (no DB query)
+		c.Chaos = s.getDayContentCached("카오스던전", c.ItemLevel)
+		c.Guardian = s.getDayContentCached("가디언토벌", c.ItemLevel)
 
 		// Assign bus gold list from batch result
 		if busGold, ok := busGoldMap[c.CharacterID]; ok {
@@ -1122,8 +1120,76 @@ func (s *CharacterService) getRaidBusGoldList(ctx context.Context, characterID i
 	return list, rows.Err()
 }
 
+// loadDayContentCache loads all day content into memory cache.
+// Cache is refreshed every 1 hour.
+func (s *CharacterService) loadDayContentCache(ctx context.Context) error {
+	s.dayContentCacheMu.Lock()
+	defer s.dayContentCacheMu.Unlock()
+
+	// Check if cache is still valid (1 hour TTL)
+	if time.Since(s.dayContentCacheTime) < time.Hour && len(s.dayContentCache) > 0 {
+		return nil
+	}
+
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT content_id, category, name, level,
+		        COALESCE(shilling, 0), COALESCE(honor_shard, 0), COALESCE(leap_stone, 0),
+		        COALESCE(destruction_stone, 0), COALESCE(guardian_stone, 0), COALESCE(jewelry, 0)
+		 FROM content
+		 WHERE category IN ('카오스던전', '가디언토벌')
+		 ORDER BY category, level DESC`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	newCache := make(map[string][]DayContentResponse)
+	for rows.Next() {
+		var c DayContentResponse
+		err := rows.Scan(
+			&c.ID, &c.Category, &c.Name, &c.Level,
+			&c.Shilling, &c.HonorShard, &c.LeapStone,
+			&c.DestructionStone, &c.GuardianStone, &c.Jewelry,
+		)
+		if err != nil {
+			return err
+		}
+		newCache[c.Category] = append(newCache[c.Category], c)
+	}
+
+	s.dayContentCache = newCache
+	s.dayContentCacheTime = time.Now()
+	return rows.Err()
+}
+
+// getDayContentCached returns the appropriate day content from cache.
+func (s *CharacterService) getDayContentCached(category string, itemLevel float64) *DayContentResponse {
+	s.dayContentCacheMu.RLock()
+	defer s.dayContentCacheMu.RUnlock()
+
+	contents, ok := s.dayContentCache[category]
+	if !ok {
+		return nil
+	}
+
+	// Contents are sorted by level DESC, find first one where level <= itemLevel
+	for i := range contents {
+		if contents[i].Level <= itemLevel {
+			return &contents[i]
+		}
+	}
+	return nil
+}
+
 // getDayContent returns the appropriate day content (chaos/guardian) for a given item level.
+// Falls back to DB query if cache is not available.
 func (s *CharacterService) getDayContent(ctx context.Context, category string, itemLevel float64) *DayContentResponse {
+	// Try cache first
+	if cached := s.getDayContentCached(category, itemLevel); cached != nil {
+		return cached
+	}
+
+	// Fallback to DB query
 	row := s.db.QueryRowContext(ctx,
 		`SELECT content_id, category, name, level,
 		        COALESCE(shilling, 0), COALESCE(honor_shard, 0), COALESCE(leap_stone, 0),
