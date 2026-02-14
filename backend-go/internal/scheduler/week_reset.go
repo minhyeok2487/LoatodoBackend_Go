@@ -45,8 +45,8 @@ func (s *Scheduler) resetWeekTodo(ctx context.Context) error {
 // This alternates between "0" and "1" each week to track 2-week raid cycles.
 func (s *Scheduler) updateTwoCycle(ctx context.Context) (int64, error) {
 	result, err := s.db.ExecContext(ctx,
-		`UPDATE key_value SET value_name = CASE
-			WHEN value_name = '0' THEN '1'
+		`UPDATE key_value SET key_value = CASE
+			WHEN key_value = '0' THEN '1'
 			ELSE '0'
 		 END
 		 WHERE key_name = 'twoCycle'`)
@@ -63,7 +63,7 @@ func (s *Scheduler) resetTodoV2CoolTime2(ctx context.Context) (int64, error) {
 	// Get current two-cycle value
 	var twoCycleValue string
 	err := s.db.QueryRowContext(ctx,
-		`SELECT value_name FROM key_value WHERE key_name = 'twoCycle'`).Scan(&twoCycleValue)
+		`SELECT key_value FROM key_value WHERE key_name = 'twoCycle'`).Scan(&twoCycleValue)
 	if err != nil {
 		return 0, err
 	}
