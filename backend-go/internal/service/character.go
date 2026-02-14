@@ -659,6 +659,7 @@ func (s *CharacterService) AddCharacter(ctx context.Context, username string, re
 }
 
 // GetCharacterList returns the full character list with todo info for a member.
+// Optimized to use batch queries instead of N+1 queries.
 func (s *CharacterService) GetCharacterList(ctx context.Context, username string) ([]CharacterResponse, error) {
 	var memberID int64
 	err := s.db.QueryRowContext(ctx,
@@ -702,6 +703,7 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 	defer rows.Close()
 
 	var characters []CharacterResponse
+	var characterIDs []int64
 	for rows.Next() {
 		var c CharacterResponse
 		var image, memo sql.NullString
@@ -743,35 +745,71 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		if combatPower.Valid {
 			c.CombatPower = combatPower.Float64
 		}
-
-		// Load TodoV2 (raid) list for this character
-		todoList, err := s.buildTodoList(ctx, c.CharacterID, c.CharacterClassName, c.GoldCharacter, c.Settings.GoldCheckPolicyEnum)
-		if err != nil {
-			return nil, err
-		}
-		c.TodoList = todoList
-
-		// Load chaos/guardian content based on itemLevel
-		c.Chaos = s.getDayContent(ctx, "카오스던전", c.ItemLevel)
-		c.Guardian = s.getDayContent(ctx, "가디언토벌", c.ItemLevel)
-
-		// Load bus gold list (internal use for gold calc)
-		busGoldList, err := s.getRaidBusGoldList(ctx, c.CharacterID)
-		if err != nil {
-			return nil, err
-		}
-		c.RaidBusGoldList = busGoldList
-
-		// Calculate week raid gold from todo list
-		s.calculateWeekRaidGold(&c)
+		c.TodoList = []TodoResponseDto{}
+		c.RaidBusGoldList = []RaidBusGoldResponse{}
 
 		characters = append(characters, c)
+		characterIDs = append(characterIDs, c.CharacterID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
 	}
 
-	if characters == nil {
-		characters = []CharacterResponse{}
+	if len(characters) == 0 {
+		return []CharacterResponse{}, nil
 	}
-	return characters, rows.Err()
+
+	// Batch load all TodoV2 data for all characters at once
+	todoMap, err := s.buildTodoListBatch(ctx, characterIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Batch load all bus gold data for all characters at once
+	busGoldMap, err := s.getRaidBusGoldListBatch(ctx, characterIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache day content by item level to avoid duplicate queries
+	dayContentCache := make(map[string]*DayContentResponse)
+
+	// Assign data to each character
+	for i := range characters {
+		c := &characters[i]
+
+		// Assign todo list from batch result
+		if todos, ok := todoMap[c.CharacterID]; ok {
+			c.TodoList = s.processTodoList(todos, c.CharacterClassName, c.GoldCharacter, c.Settings.GoldCheckPolicyEnum)
+		}
+
+		// Load chaos/guardian content with caching
+		chaosKey := fmt.Sprintf("카오스던전_%.0f", c.ItemLevel)
+		if cached, ok := dayContentCache[chaosKey]; ok {
+			c.Chaos = cached
+		} else {
+			c.Chaos = s.getDayContent(ctx, "카오스던전", c.ItemLevel)
+			dayContentCache[chaosKey] = c.Chaos
+		}
+
+		guardianKey := fmt.Sprintf("가디언토벌_%.0f", c.ItemLevel)
+		if cached, ok := dayContentCache[guardianKey]; ok {
+			c.Guardian = cached
+		} else {
+			c.Guardian = s.getDayContent(ctx, "가디언토벌", c.ItemLevel)
+			dayContentCache[guardianKey] = c.Guardian
+		}
+
+		// Assign bus gold list from batch result
+		if busGold, ok := busGoldMap[c.CharacterID]; ok {
+			c.RaidBusGoldList = busGold
+		}
+
+		// Calculate week raid gold from todo list
+		s.calculateWeekRaidGold(c)
+	}
+
+	return characters, nil
 }
 
 // GetDeletedCharacters returns deleted characters for a member.
@@ -1106,4 +1144,217 @@ func (s *CharacterService) getDayContent(ctx context.Context, category string, i
 		return nil
 	}
 	return &c
+}
+
+// buildTodoListBatch loads all TodoV2 rows for multiple characters in a single query.
+func (s *CharacterService) buildTodoListBatch(ctx context.Context, characterIDs []int64) (map[int64][]todoV2Row, error) {
+	if len(characterIDs) == 0 {
+		return make(map[int64][]todoV2Row), nil
+	}
+
+	// Build IN clause
+	placeholders := make([]string, len(characterIDs))
+	args := make([]interface{}, len(characterIDs))
+	for i, id := range characterIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := "(" + joinStrings(placeholders, ",") + ")"
+
+	query := `SELECT t.character_id, t.todo_id, wc.week_category,
+	                 COALESCE(wc.week_content_category, ''),
+	                 COALESCE(wc.gate, 0),
+	                 COALESCE(wc.gold, 0), COALESCE(wc.character_gold, 0),
+	                 COALESCE(t.gold_check, false), COALESCE(t.is_checked, false),
+	                 COALESCE(t.sort_number, 0), t.message,
+	                 COALESCE(t.cool_time, 1),
+	                 COALESCE(t.more_reward_check, false), COALESCE(wc.more_reward_gold, 0)
+	          FROM todov2 t
+	          LEFT JOIN content wc ON t.content_id = wc.content_id
+	          WHERE t.character_id IN ` + inClause + ` AND COALESCE(t.cool_time, 1) >= 1
+	          ORDER BY t.character_id, COALESCE(wc.gate, 0) ASC`
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch querying todov2: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64][]todoV2Row)
+	for rows.Next() {
+		var charID int64
+		var t todoV2Row
+		var message sql.NullString
+		err := rows.Scan(
+			&charID, &t.ID, &t.WeekCategory,
+			&t.WeekContentCategory, &t.Gate,
+			&t.Gold, &t.CharacterGold,
+			&t.GoldCheck, &t.IsChecked,
+			&t.SortNumber, &message,
+			&t.CoolTime,
+			&t.MoreRewardCheck, &t.MoreRewardGold,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("scanning todov2 batch: %w", err)
+		}
+		if message.Valid {
+			t.Message = &message.String
+		}
+		result[charID] = append(result[charID], t)
+	}
+
+	return result, rows.Err()
+}
+
+// processTodoList converts raw todoV2 rows to TodoResponseDto list (matching Spring Boot grouping logic).
+func (s *CharacterService) processTodoList(todoRows []todoV2Row, charClassName string, goldCharacter bool, goldPolicy string) []TodoResponseDto {
+	if len(todoRows) == 0 {
+		return []TodoResponseDto{}
+	}
+
+	// Group by weekCategory into TodoResponseDto
+	dtoMap := make(map[string]*TodoResponseDto)
+	var dtoOrder []string
+
+	for _, t := range todoRows {
+		existing, ok := dtoMap[t.WeekCategory]
+		if !ok {
+			realGold := 0
+			charGold := 0
+			if goldCharacter {
+				realGold = t.Gold
+				if t.MoreRewardCheck && t.CharacterGold == 0 {
+					realGold -= t.MoreRewardGold
+				}
+				if t.CharacterGold != 0 {
+					charGold = t.CharacterGold
+					if t.MoreRewardCheck {
+						charGold -= t.MoreRewardGold
+					}
+				}
+			}
+			dto := &TodoResponseDto{
+				ID:                  t.ID,
+				WeekCategory:        t.WeekCategory,
+				WeekContentCategory: t.WeekContentCategory,
+				Gold:                t.Gold,
+				RealGold:            realGold,
+				GoldCheck:           t.GoldCheck,
+				Message:             t.Message,
+				CurrentGate:         0,
+				TotalGate:           t.Gate,
+				SortNumber:          t.SortNumber,
+				CharacterClassName:  charClassName,
+				MoreRewardCheckList: []bool{t.MoreRewardCheck},
+				MoreRewardGoldList:  []int{t.MoreRewardGold},
+				CharacterGold:       charGold,
+			}
+			if t.IsChecked {
+				dto.CurrentGate = t.Gate
+			}
+			dtoMap[t.WeekCategory] = dto
+			dtoOrder = append(dtoOrder, t.WeekCategory)
+		} else {
+			// Merge into existing entry (multi-gate raid)
+			existing.Gold += t.Gold
+			existing.TotalGate = t.Gate
+			existing.MoreRewardCheckList = append(existing.MoreRewardCheckList, t.MoreRewardCheck)
+			existing.MoreRewardGoldList = append(existing.MoreRewardGoldList, t.MoreRewardGold)
+
+			if goldCharacter {
+				addRealGold := t.Gold
+				if t.MoreRewardCheck && t.CharacterGold == 0 {
+					addRealGold -= t.MoreRewardGold
+				}
+				existing.RealGold += addRealGold
+				if t.CharacterGold != 0 {
+					addCharGold := t.CharacterGold
+					if t.MoreRewardCheck {
+						addCharGold -= t.MoreRewardGold
+					}
+					existing.CharacterGold += addCharGold
+				}
+			}
+
+			if t.IsChecked {
+				existing.CurrentGate = t.Gate
+			}
+		}
+	}
+
+	// Apply RAID_CHECK_POLICY if applicable
+	if goldPolicy == "RAID_CHECK_POLICY" {
+		for _, dto := range dtoMap {
+			dto.RealGold -= dto.Gold
+		}
+	}
+
+	// Build result in order, mark completed
+	result := make([]TodoResponseDto, 0, len(dtoOrder))
+	for _, cat := range dtoOrder {
+		dto := dtoMap[cat]
+		if dto.CurrentGate == dto.TotalGate {
+			dto.Check = true
+		}
+		result = append(result, *dto)
+	}
+
+	return result
+}
+
+// getRaidBusGoldListBatch loads all bus gold data for multiple characters in a single query.
+func (s *CharacterService) getRaidBusGoldListBatch(ctx context.Context, characterIDs []int64) (map[int64][]RaidBusGoldResponse, error) {
+	if len(characterIDs) == 0 {
+		return make(map[int64][]RaidBusGoldResponse), nil
+	}
+
+	// Build IN clause
+	placeholders := make([]string, len(characterIDs))
+	args := make([]interface{}, len(characterIDs))
+	for i, id := range characterIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	inClause := "(" + joinStrings(placeholders, ",") + ")"
+
+	query := `SELECT character_id, week_category, COALESCE(bus_gold, 0)
+	          FROM raid_bus_gold
+	          WHERE character_id IN ` + inClause
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch querying raid_bus_gold: %w", err)
+	}
+	defer rows.Close()
+
+	result := make(map[int64][]RaidBusGoldResponse)
+	for rows.Next() {
+		var charID int64
+		var r RaidBusGoldResponse
+		if err := rows.Scan(&charID, &r.WeekCategory, &r.BusGold); err != nil {
+			return nil, fmt.Errorf("scanning raid_bus_gold batch: %w", err)
+		}
+		result[charID] = append(result[charID], r)
+	}
+
+	// Initialize empty slices for characters with no bus gold
+	for _, id := range characterIDs {
+		if _, ok := result[id]; !ok {
+			result[id] = []RaidBusGoldResponse{}
+		}
+	}
+
+	return result, rows.Err()
+}
+
+// joinStrings joins strings with a separator (simple helper to avoid importing strings package).
+func joinStrings(strs []string, sep string) string {
+	if len(strs) == 0 {
+		return ""
+	}
+	result := strs[0]
+	for i := 1; i < len(strs); i++ {
+		result += sep + strs[i]
+	}
+	return result
 }
