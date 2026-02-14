@@ -88,7 +88,7 @@ func NewRouter(
 		r.Patch("/provider", memberHandler.ChangeProvider)
 		r.Post("/ads", memberHandler.SaveAds)
 		r.Delete("/characters", memberHandler.DeleteAllCharacters)
-		r.Patch("/api-key", memberHandler.UpdateAPIKey)
+		r.Post("/api-key", memberHandler.UpdateAPIKey)
 	})
 
 	// ========== Character routes ==========

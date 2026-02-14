@@ -377,8 +377,8 @@ func (s *FriendService) SearchCharacter(ctx context.Context, username, character
 		return nil, fmt.Errorf("캐릭터 검색 반복 오류: %w", err)
 	}
 
-	if results == nil {
-		results = []FriendFindCharacterResponse{}
+	if results == nil || len(results) == 0 {
+		return nil, fmt.Errorf("존재하지 않는 캐릭터입니다")
 	}
 	return results, nil
 }

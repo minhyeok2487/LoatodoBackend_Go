@@ -680,6 +680,10 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		"SELECT member_id FROM member WHERE username = ?", username,
 	).Scan(&memberID)
 	if err != nil {
+		if err == sql.ErrNoRows {
+			// 존재하지 않는 사용자인 경우 빈 배열 반환 (Spring 동작과 일치)
+			return []CharacterResponse{}, nil
+		}
 		return nil, fmt.Errorf("querying member: %w", err)
 	}
 

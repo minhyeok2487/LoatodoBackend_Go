@@ -16,7 +16,7 @@ func NewCustomTodoService(db *sql.DB) *CustomTodoService {
 }
 
 type CustomTodoResponse struct {
-	ID          int64  `json:"id"`
+	ID          int64  `json:"customTodoId"`
 	CharacterID int64  `json:"characterId"`
 	ContentName string `json:"contentName"`
 	Frequency   string `json:"frequency"`

@@ -40,7 +40,7 @@ func (h *CustomTodoHandler) CreateCustomTodo(w http.ResponseWriter, r *http.Requ
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusCreated, todo)
+	writeJSON(w, http.StatusOK, todo)
 }
 
 // ToggleCheck handles POST /api/v1/custom/check (Spring Boot sends customTodoId in body)
@@ -60,10 +60,10 @@ func (h *CustomTodoHandler) ToggleCheck(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"message": "toggled"})
 }
 
-// UpdateCustomTodo handles PATCH /api/v1/custom-todo/{id}
+// UpdateCustomTodo handles PATCH /api/v1/custom/{customTodoId}
 func (h *CustomTodoHandler) UpdateCustomTodo(w http.ResponseWriter, r *http.Request) {
 	username := auth.GetUsername(r)
-	id := parseInt64Param(getPathParam(r, "id"))
+	id := parseInt64Param(getPathParam(r, "customTodoId"))
 	var req service.UpdateCustomTodoRequest
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body")
@@ -76,10 +76,10 @@ func (h *CustomTodoHandler) UpdateCustomTodo(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, map[string]string{"message": "custom todo updated"})
 }
 
-// DeleteCustomTodo handles DELETE /api/v1/custom-todo/{id}
+// DeleteCustomTodo handles DELETE /api/v1/custom/{customTodoId}
 func (h *CustomTodoHandler) DeleteCustomTodo(w http.ResponseWriter, r *http.Request) {
 	username := auth.GetUsername(r)
-	id := parseInt64Param(getPathParam(r, "id"))
+	id := parseInt64Param(getPathParam(r, "customTodoId"))
 	if err := h.svc.DeleteCustomTodo(r.Context(), username, id); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
