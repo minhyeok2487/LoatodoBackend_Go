@@ -174,8 +174,52 @@
 
 ---
 
+## 5. 외부 API 연동 테스트 - 2026-02-14
+
+### 로스트아크 API 클라이언트 비교
+| 항목 | Go | Spring |
+|------|-----|--------|
+| HTTP 클라이언트 | net/http | WebClient |
+| 타임아웃 | 30초 | 30초 |
+| API 엔드포인트 | developer-lostark.game.onstove.com | 동일 |
+
+### 에러 처리 비교
+| HTTP 상태 | Go 메시지 | Spring 메시지 |
+|-----------|-----------|---------------|
+| 401 | "올바르지 않은 apiKey 입니다." | 동일 |
+| 429 | "사용한도 (1분에 100개)를 초과했습니다." | 동일 |
+| 503 | "로스트아크 서버가 점검중 입니다." | 동일 |
+
+### 테스트 결과
+| 테스트 | Go | Spring | 결과 |
+|--------|-----|--------|------|
+| API 키 검증 | PATCH 405 | POST 400 | ⚠️ 메소드 차이 |
+| 캐릭터 검색 (없는 캐릭터) | 200 [] | 400 에러 | ⚠️ 동작 차이 |
+| 시장 데이터 조회 | 403 | 403 | ✅ 일치 |
+| 캐릭터 목록 조회 | 200 | 200 | ✅ 일치 |
+
+**총 결과: 4/6 일치 (66.7%)**
+
+### 발견된 차이점
+1. **API 키 검증 엔드포인트**
+   - Go: `PATCH /api/v1/member/api-key`
+   - Spring: `POST /api/v1/member/api-key`
+   - **참고**: HTTP 메소드 차이 (기능은 동일)
+
+2. **캐릭터 검색 (없는 캐릭터)**
+   - Go: 200 OK + 빈 배열 `[]`
+   - Spring: 400 + 에러 메시지
+   - **참고**: Go가 REST API 관점에서 더 적절
+
+### 로스트아크 API 엔드포인트
+- `/characters/{name}/siblings` - 계정 전체 캐릭터 조회 (1415+ 필터)
+- `/armories/characters/{name}/profiles` - 캐릭터 프로필 상세
+
+---
+
 ## 테스트 스크립트
 - `/tmp/write_api_test.py` - 쓰기 API 테스트
 - `/tmp/error_handling_test.py` - 에러 처리 테스트
 - `/tmp/scheduler_test.py` - 스케줄러 테스트
+- `/tmp/external_api_test.py` - 외부 API 연동 테스트
 - `/tmp/multi_api_load_test_v2.py` - 다중 API 부하 테스트
