@@ -121,7 +121,61 @@
 
 ---
 
+## 4. 스케줄러 테스트 - 2026-02-14
+
+### 스케줄러 구현 비교
+| 항목 | Go | Spring |
+|------|-----|--------|
+| 라이브러리 | robfig/cron | Spring @Scheduled |
+| 분산 락 | ShedLock (직접 구현) | ShedLock 라이브러리 |
+| 타임존 | Asia/Seoul | Asia/Seoul |
+| 호환성 | Java ShedLock 테이블 호환 | - |
+
+### 등록된 스케줄러 작업
+| 작업명 | 스케줄 | 설명 |
+|--------|--------|------|
+| resetDayTodo | 매일 06:00 | 일일숙제 리셋 (카오스/가디언/에포나) |
+| resetWeekTodo | 수요일 06:02 | 주간숙제 리셋 (레이드/주간에포나) |
+| updateMarketData | 매일 01:00 | 시장 가격 업데이트 |
+| checkScheduleRaids | 10분마다 | 스케줄 레이드 자동 체크 |
+| addEnergyToAllLifeEnergies | 30분마다 | 생활 에너지 충전 |
+
+### 일일 리셋 로직 (resetDayTodo)
+```
+1. updateDayContentGauge - 휴식게이지 증가 (check * 10, 최대 100)
+2. saveBeforeGauge - 이전 게이지 저장
+3. updateDayContentCheck - 체크 초기화 (0으로)
+4. updateDayTodoGold - 가디언 골드 재계산
+5. updateCustomDailyTodo - 일일 커스텀 할일 초기화
+6. resetServerTodoState - 서버 할일 상태 초기화
+```
+
+### 주간 리셋 로직 (resetWeekTodo)
+```
+1. updateTwoCycle - 2주기 토글 (0 ↔ 1)
+2. resetTodoV2CoolTime2 - 2주기 레이드 처리
+3. resetTodoV2 - 레이드 체크 초기화
+4. updateWeekContent - 주간 콘텐츠 초기화
+5. updateWeekDayTodoTotalGold - 주간 골드 초기화
+6. updateCustomWeeklyTodo - 주간 커스텀 할일 초기화
+7. deleteAllRaidBusGold - 버스 골드 삭제
+```
+
+### ShedLock 분산 락
+- Go 서버: `locked_by = "go-server"`
+- Spring 서버: `locked_by = "spring-server"`
+- **결과**: 두 서버가 동시에 실행되어도 ShedLock 테이블을 공유하여 중복 실행 방지
+
+### 테스트 결과
+- ✅ Go 스케줄러 정상 시작 확인 (로그: "scheduler started")
+- ✅ ShedLock 분산 락 구현 검증 (Java ShedLock과 호환)
+- ✅ 일일/주간 리셋 SQL 로직 검증 (코드 분석)
+- ✅ Spring과 동일한 cron 스케줄 설정 확인
+
+---
+
 ## 테스트 스크립트
 - `/tmp/write_api_test.py` - 쓰기 API 테스트
 - `/tmp/error_handling_test.py` - 에러 처리 테스트
+- `/tmp/scheduler_test.py` - 스케줄러 테스트
 - `/tmp/multi_api_load_test_v2.py` - 다중 API 부하 테스트
