@@ -16,13 +16,21 @@ func NewScheduleService(db *sql.DB) *ScheduleService {
 }
 
 type ScheduleResponse struct {
-	ScheduleID            int64  `json:"scheduleId"`
-	ScheduleCategory      string `json:"scheduleCategory"`
-	ScheduleRaidCategory  string `json:"scheduleRaidCategory"`
-	RaidName              string `json:"raidName"`
-	DayOfWeek             int    `json:"dayOfWeek"`
-	TimeSlot              string `json:"timeSlot"`
-	Memo                  string `json:"memo"`
+	ScheduleID           int64    `json:"scheduleId"`
+	ScheduleCategory     string   `json:"scheduleCategory"`
+	ScheduleRaidCategory string   `json:"scheduleRaidCategory"`
+	RaidName             string   `json:"raidName"`
+	DayOfWeek            string   `json:"dayOfWeek"`
+	RepeatWeek           bool     `json:"repeatWeek"`
+	Date                 *string  `json:"date"`
+	Time                 string   `json:"time"`
+	Memo                 string   `json:"memo"`
+	IsLeader             bool     `json:"isLeader"`
+	LeaderScheduleId     int64    `json:"leaderScheduleId"`
+	CharacterName        string   `json:"characterName"`
+	LeaderCharacterName  string   `json:"leaderCharacterName"`
+	FriendCharacterNames []string `json:"friendCharacterNames"`
+	AutoCheck            bool     `json:"autoCheck"`
 }
 
 type CreateScheduleRequest struct {
@@ -65,6 +73,15 @@ type ScheduleCharacter struct {
 type WeekScheduleResponse struct {
 	DayOfWeek int               `json:"dayOfWeek"`
 	Schedules []ScheduleResponse `json:"schedules"`
+}
+
+// dayOfWeekIntToString converts day of week integer to Spring's DayOfWeek enum string
+func dayOfWeekIntToString(day int) string {
+	days := []string{"SUNDAY", "MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"}
+	if day >= 0 && day < 7 {
+		return days[day]
+	}
+	return ""
 }
 
 // getMemberID resolves the member_id for a given username.
@@ -116,9 +133,14 @@ func (s *ScheduleService) GetSchedules(ctx context.Context, username, startDate,
 	}
 
 	// Build the IN clause
-	query := `SELECT schedule_id, schedule_category, schedule_raid_category,
-	                 COALESCE(raid_name, ''), COALESCE(day_of_week, 0), COALESCE(time, ''), COALESCE(memo, '')
-	          FROM schedule WHERE character_id IN (`
+	query := `SELECT s.schedule_id, s.schedule_category, s.schedule_raid_category,
+	                 COALESCE(s.raid_name, ''), COALESCE(s.day_of_week, 0),
+	                 IFNULL(s.repeat_week, 0), s.date, COALESCE(s.time, ''), COALESCE(s.memo, ''),
+	                 IFNULL(s.leader, 0), COALESCE(s.leader_schedule_id, 0),
+	                 COALESCE(c.character_name, ''), IFNULL(s.auto_check, 0)
+	          FROM schedule s
+	          LEFT JOIN characters c ON s.character_id = c.characters_id
+	          WHERE s.character_id IN (`
 	args := make([]interface{}, 0, len(charIDs)+2)
 	for i, id := range charIDs {
 		if i > 0 {
@@ -129,13 +151,13 @@ func (s *ScheduleService) GetSchedules(ctx context.Context, username, startDate,
 	}
 	query += ")"
 
-	// Optional date range filter
+	// Optional date range filter (for month view)
 	if startDate != "" && endDate != "" {
-		query += " AND date >= ? AND date <= ?"
+		query += " AND (s.repeat_week = 1 OR (s.date >= ? AND s.date <= ?))"
 		args = append(args, startDate, endDate)
 	}
 
-	query += " ORDER BY day_of_week ASC, time ASC"
+	query += " ORDER BY s.day_of_week ASC, s.time ASC"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -146,10 +168,39 @@ func (s *ScheduleService) GetSchedules(ctx context.Context, username, startDate,
 	var schedules []ScheduleResponse
 	for rows.Next() {
 		var sr ScheduleResponse
+		var dayOfWeekInt int
+		var repeatWeekInt int
+		var leaderInt int
+		var autoCheckInt int
+		var dateStr sql.NullString
+
 		if err := rows.Scan(&sr.ScheduleID, &sr.ScheduleCategory, &sr.ScheduleRaidCategory,
-			&sr.RaidName, &sr.DayOfWeek, &sr.TimeSlot, &sr.Memo); err != nil {
+			&sr.RaidName, &dayOfWeekInt, &repeatWeekInt, &dateStr, &sr.Time, &sr.Memo,
+			&leaderInt, &sr.LeaderScheduleId, &sr.CharacterName, &autoCheckInt); err != nil {
 			return nil, err
 		}
+
+		// Convert day of week int to string enum
+		sr.DayOfWeek = dayOfWeekIntToString(dayOfWeekInt)
+
+		// Convert BIT fields (now as int due to IFNULL) to bool
+		sr.RepeatWeek = repeatWeekInt == 1
+		sr.IsLeader = leaderInt == 1
+		sr.AutoCheck = autoCheckInt == 1
+
+		// Handle date
+		if dateStr.Valid {
+			sr.Date = &dateStr.String
+		}
+
+		// Set leader character name (same as character name if leader)
+		if sr.IsLeader {
+			sr.LeaderCharacterName = sr.CharacterName
+		}
+
+		// Initialize friendCharacterNames as empty array (required by frontend)
+		sr.FriendCharacterNames = []string{}
+
 		schedules = append(schedules, sr)
 	}
 	if err := rows.Err(); err != nil {
@@ -198,13 +249,14 @@ func (s *ScheduleService) CreateSchedule(ctx context.Context, username string, r
 	}
 
 	return &ScheduleResponse{
-		ScheduleID:           scheduleID,
-		ScheduleCategory:     req.ScheduleCategory,
-		ScheduleRaidCategory: req.ScheduleRaidCategory,
-		RaidName:             req.RaidName,
-		DayOfWeek:            req.DayOfWeek,
-		TimeSlot:             req.TimeSlot,
-		Memo:                 req.Memo,
+		ScheduleID:            scheduleID,
+		ScheduleCategory:      req.ScheduleCategory,
+		ScheduleRaidCategory:  req.ScheduleRaidCategory,
+		RaidName:              req.RaidName,
+		DayOfWeek:             dayOfWeekIntToString(req.DayOfWeek),
+		Time:                  req.TimeSlot,
+		Memo:                  req.Memo,
+		FriendCharacterNames:  []string{},
 	}, nil
 }
 
@@ -386,9 +438,14 @@ func (s *ScheduleService) GetWeekSchedule(ctx context.Context, username string) 
 	}
 
 	// Build the IN clause
-	query := `SELECT schedule_id, schedule_category, schedule_raid_category,
-	                 COALESCE(raid_name, ''), COALESCE(day_of_week, 0), COALESCE(time, ''), COALESCE(memo, '')
-	          FROM schedule WHERE character_id IN (`
+	query := `SELECT s.schedule_id, s.schedule_category, s.schedule_raid_category,
+	                 COALESCE(s.raid_name, ''), COALESCE(s.day_of_week, 0),
+	                 IFNULL(s.repeat_week, 0), s.date, COALESCE(s.time, ''), COALESCE(s.memo, ''),
+	                 IFNULL(s.leader, 0), COALESCE(s.leader_schedule_id, 0),
+	                 COALESCE(c.character_name, ''), IFNULL(s.auto_check, 0)
+	          FROM schedule s
+	          LEFT JOIN characters c ON s.character_id = c.characters_id
+	          WHERE s.character_id IN (`
 	args := make([]interface{}, 0, len(charIDs))
 	for i, id := range charIDs {
 		if i > 0 {
@@ -397,7 +454,7 @@ func (s *ScheduleService) GetWeekSchedule(ctx context.Context, username string) 
 		query += "?"
 		args = append(args, id)
 	}
-	query += ") ORDER BY day_of_week ASC, time ASC"
+	query += ") ORDER BY s.day_of_week ASC, s.time ASC"
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -409,11 +466,40 @@ func (s *ScheduleService) GetWeekSchedule(ctx context.Context, username string) 
 	dayMap := make(map[int][]ScheduleResponse)
 	for rows.Next() {
 		var sr ScheduleResponse
+		var dayOfWeekInt int
+		var repeatWeekInt int
+		var leaderInt int
+		var autoCheckInt int
+		var dateStr sql.NullString
+
 		if err := rows.Scan(&sr.ScheduleID, &sr.ScheduleCategory, &sr.ScheduleRaidCategory,
-			&sr.RaidName, &sr.DayOfWeek, &sr.TimeSlot, &sr.Memo); err != nil {
+			&sr.RaidName, &dayOfWeekInt, &repeatWeekInt, &dateStr, &sr.Time, &sr.Memo,
+			&leaderInt, &sr.LeaderScheduleId, &sr.CharacterName, &autoCheckInt); err != nil {
 			return nil, err
 		}
-		dayMap[sr.DayOfWeek] = append(dayMap[sr.DayOfWeek], sr)
+
+		// Convert day of week int to string enum
+		sr.DayOfWeek = dayOfWeekIntToString(dayOfWeekInt)
+
+		// Convert BIT fields (now as int due to IFNULL) to bool
+		sr.RepeatWeek = repeatWeekInt == 1
+		sr.IsLeader = leaderInt == 1
+		sr.AutoCheck = autoCheckInt == 1
+
+		// Handle date
+		if dateStr.Valid {
+			sr.Date = &dateStr.String
+		}
+
+		// Set leader character name
+		if sr.IsLeader {
+			sr.LeaderCharacterName = sr.CharacterName
+		}
+
+		// Initialize friendCharacterNames as empty array
+		sr.FriendCharacterNames = []string{}
+
+		dayMap[dayOfWeekInt] = append(dayMap[dayOfWeekInt], sr)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

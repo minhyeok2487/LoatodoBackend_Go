@@ -16,10 +16,16 @@ func NewLogsService(db *sql.DB) *LogsService {
 }
 
 type LogResponse struct {
-	LogID      int64     `json:"logId"`
-	LogContent string    `json:"logContent"`
-	Profit     float64   `json:"profit"`
-	CreatedAt  time.Time `json:"createdAt"`
+	LogsID             int64   `json:"logsId"`
+	CreatedDate        string  `json:"createdDate"`
+	LocalDate          string  `json:"localDate"`
+	LogType            string  `json:"logType"`
+	LogContent         string  `json:"logContent"`
+	Name               string  `json:"name"`
+	Message            string  `json:"message"`
+	Profit             float64 `json:"profit"`
+	CharacterClassName string  `json:"characterClassName"`
+	CharacterName      string  `json:"characterName"`
 }
 
 type LogListResponse struct {
@@ -53,10 +59,14 @@ func (s *LogsService) GetLogs(ctx context.Context, username string, page, size i
 
 	offset := page * size
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT logs_id, COALESCE(log_content, ''), profit, created_date
-		 FROM logs
-		 WHERE member_id = ? AND deleted = false
-		 ORDER BY created_date DESC
+		`SELECT l.logs_id, l.last_modified_date, l.local_date,
+		        COALESCE(l.log_type, ''), COALESCE(l.log_content, ''),
+		        COALESCE(l.name, ''), COALESCE(l.message, ''), l.profit,
+		        COALESCE(c.character_class_name, ''), COALESCE(c.character_name, '')
+		 FROM logs l
+		 LEFT JOIN characters c ON c.characters_id = l.character_id
+		 WHERE l.member_id = ? AND l.deleted = false
+		 ORDER BY l.last_modified_date DESC
 		 LIMIT ? OFFSET ?`,
 		memberID, size, offset)
 	if err != nil {
@@ -67,8 +77,17 @@ func (s *LogsService) GetLogs(ctx context.Context, username string, page, size i
 	var logs []LogResponse
 	for rows.Next() {
 		var l LogResponse
-		if err := rows.Scan(&l.LogID, &l.LogContent, &l.Profit, &l.CreatedAt); err != nil {
+		var lastModifiedDate time.Time
+		var localDate sql.NullTime
+		if err := rows.Scan(&l.LogsID, &lastModifiedDate, &localDate,
+			&l.LogType, &l.LogContent, &l.Name, &l.Message, &l.Profit,
+			&l.CharacterClassName, &l.CharacterName); err != nil {
 			return nil, fmt.Errorf("scanning log: %w", err)
+		}
+		// Format dates to match Spring's ISO format
+		l.CreatedDate = lastModifiedDate.Format("2006-01-02T15:04:05")
+		if localDate.Valid {
+			l.LocalDate = localDate.Time.Format("2006-01-02")
 		}
 		logs = append(logs, l)
 	}
@@ -97,10 +116,11 @@ func (s *LogsService) CreateLog(ctx context.Context, username string, req Create
 	}
 
 	now := time.Now()
+	localDate := now.Format("2006-01-02")
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO logs (member_id, log_content, profit, deleted, created_date, last_modified_date)
-		 VALUES (?, ?, ?, false, ?, ?)`,
-		memberID, req.LogContent, req.Profit, now, now)
+		`INSERT INTO logs (member_id, log_content, profit, deleted, created_date, last_modified_date, local_date)
+		 VALUES (?, ?, ?, false, ?, ?, ?)`,
+		memberID, req.LogContent, req.Profit, now, now, localDate)
 	if err != nil {
 		return nil, fmt.Errorf("inserting log: %w", err)
 	}
@@ -111,10 +131,11 @@ func (s *LogsService) CreateLog(ctx context.Context, username string, req Create
 	}
 
 	return &LogResponse{
-		LogID:      id,
-		LogContent: req.LogContent,
-		Profit:     req.Profit,
-		CreatedAt:  now,
+		LogsID:      id,
+		LogContent:  req.LogContent,
+		Profit:      req.Profit,
+		CreatedDate: now.Format("2006-01-02T15:04:05"),
+		LocalDate:   localDate,
 	}, nil
 }
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -726,34 +727,57 @@ func (s *CharacterService) GetCharacterList(ctx context.Context, username string
 		var c CharacterResponse
 		var image, memo sql.NullString
 		var combatPower sql.NullFloat64
+		// BIT fields converted with +0 return integers
+		var goldCharacterInt, challengeGuardianInt, challengeAbyssInt int
+		var silmaelChangeInt int
+		var showCharInt, showEponaInt, showChaosInt, showGuardianInt int
+		var showWeekTodoInt, showWeekEponaInt, showSilmaelChangeInt, showCubeTicketInt int
+		var goldCheckVersionInt, linkCubeCalInt, showMoreButtonInt, showElysianInt int
 		err := rows.Scan(
 			&c.CharacterID, &c.MemberID, &c.ServerName, &c.CharacterName,
 			&c.CharacterClassName, &image, &c.ItemLevel,
-			&combatPower, &c.SortNumber, &memo, &c.GoldCharacter,
-			&c.ChallengeGuardian, &c.ChallengeAbyss,
+			&combatPower, &c.SortNumber, &memo, &goldCharacterInt,
+			&challengeGuardianInt, &challengeAbyssInt,
 			&c.ChaosCheck, &c.ChaosGauge, &c.ChaosGold,
 			&c.GuardianCheck, &c.GuardianGauge, &c.GuardianGold,
 			&c.EponaCheck, &c.EponaGauge,
 			&c.WeekDayTodoGold,
 			&c.WeekEpona,
-			&c.SilmaelChange, &c.CubeTicket,
+			&silmaelChangeInt, &c.CubeTicket,
 			&c.ElysianCount,
 			&c.BeforeEponaGauge, &c.BeforeChaosGauge,
 			&c.BeforeGuardianGauge,
-			&c.Settings.ShowCharacter, &c.Settings.ShowEpona,
+			&showCharInt, &showEponaInt,
 			&c.Settings.ThresholdEpona,
-			&c.Settings.ShowChaos, &c.Settings.ThresholdChaos,
-			&c.Settings.ShowGuardian, &c.Settings.ThresholdGuardian,
-			&c.Settings.ShowWeekTodo, &c.Settings.ShowWeekEpona,
-			&c.Settings.ShowSilmaelChange, &c.Settings.ShowCubeTicket,
-			&c.Settings.GoldCheckVersion,
+			&showChaosInt, &c.Settings.ThresholdChaos,
+			&showGuardianInt, &c.Settings.ThresholdGuardian,
+			&showWeekTodoInt, &showWeekEponaInt,
+			&showSilmaelChangeInt, &showCubeTicketInt,
+			&goldCheckVersionInt,
 			&c.Settings.GoldCheckPolicyEnum,
-			&c.Settings.LinkCubeCal, &c.Settings.ShowMoreButton,
-			&c.Settings.ShowElysian,
+			&linkCubeCalInt, &showMoreButtonInt,
+			&showElysianInt,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning character: %w", err)
 		}
+		// Convert int to bool
+		c.GoldCharacter = goldCharacterInt != 0
+		c.ChallengeGuardian = challengeGuardianInt != 0
+		c.ChallengeAbyss = challengeAbyssInt != 0
+		c.SilmaelChange = silmaelChangeInt != 0
+		c.Settings.ShowCharacter = showCharInt != 0
+		c.Settings.ShowEpona = showEponaInt != 0
+		c.Settings.ShowChaos = showChaosInt != 0
+		c.Settings.ShowGuardian = showGuardianInt != 0
+		c.Settings.ShowWeekTodo = showWeekTodoInt != 0
+		c.Settings.ShowWeekEpona = showWeekEponaInt != 0
+		c.Settings.ShowSilmaelChange = showSilmaelChangeInt != 0
+		c.Settings.ShowCubeTicket = showCubeTicketInt != 0
+		c.Settings.GoldCheckVersion = goldCheckVersionInt != 0
+		c.Settings.LinkCubeCal = linkCubeCalInt != 0
+		c.Settings.ShowMoreButton = showMoreButtonInt != 0
+		c.Settings.ShowElysian = showElysianInt != 0
 		if image.Valid {
 			c.CharacterImage = &image.String
 		}
@@ -935,10 +959,10 @@ func (s *CharacterService) buildTodoList(ctx context.Context, characterID int64,
 		        COALESCE(wc.week_content_category, ''),
 		        COALESCE(wc.gate, 0),
 		        COALESCE(wc.gold, 0), COALESCE(wc.character_gold, 0),
-		        COALESCE(t.gold_check, false), COALESCE(t.is_checked, false),
+		        COALESCE(t.gold_check+0, 0), COALESCE(t.is_checked+0, 0),
 		        COALESCE(t.sort_number, 0), t.message,
 		        COALESCE(t.cool_time, 1),
-		        COALESCE(t.more_reward_check, false), COALESCE(wc.more_reward_gold, 0)
+		        COALESCE(t.more_reward_check+0, 0), COALESCE(wc.more_reward_gold, 0)
 		 FROM todov2 t
 		 LEFT JOIN content wc ON t.content_id = wc.content_id
 		 WHERE t.character_id = ? AND COALESCE(t.cool_time, 1) >= 1
@@ -953,18 +977,23 @@ func (s *CharacterService) buildTodoList(ctx context.Context, characterID int64,
 	for rows.Next() {
 		var t todoV2Row
 		var message sql.NullString
+		var goldCheckInt, isCheckedInt, moreRewardCheckInt int // BIT+0 returns int
 		err := rows.Scan(
 			&t.ID, &t.WeekCategory,
 			&t.WeekContentCategory, &t.Gate,
 			&t.Gold, &t.CharacterGold,
-			&t.GoldCheck, &t.IsChecked,
+			&goldCheckInt, &isCheckedInt,
 			&t.SortNumber, &message,
 			&t.CoolTime,
-			&t.MoreRewardCheck, &t.MoreRewardGold,
+			&moreRewardCheckInt, &t.MoreRewardGold,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning todov2: %w", err)
 		}
+		// Convert int to bool
+		t.GoldCheck = goldCheckInt != 0
+		t.IsChecked = isCheckedInt != 0
+		t.MoreRewardCheck = moreRewardCheckInt != 0
 		if message.Valid {
 			t.Message = &message.String
 		}
@@ -1044,10 +1073,12 @@ func (s *CharacterService) buildTodoList(ctx context.Context, characterID int64,
 		}
 	}
 
-	// Apply RAID_CHECK_POLICY if applicable
+	// Apply RAID_CHECK_POLICY if applicable (only for todos where goldCheck is false)
 	if goldPolicy == "RAID_CHECK_POLICY" {
 		for _, dto := range dtoMap {
-			dto.RealGold -= dto.Gold
+			if !dto.GoldCheck {
+				dto.RealGold -= dto.Gold
+			}
 		}
 	}
 
@@ -1235,10 +1266,10 @@ func (s *CharacterService) buildTodoListBatch(ctx context.Context, characterIDs 
 	                 COALESCE(wc.week_content_category, ''),
 	                 COALESCE(wc.gate, 0),
 	                 COALESCE(wc.gold, 0), COALESCE(wc.character_gold, 0),
-	                 COALESCE(t.gold_check, false), COALESCE(t.is_checked, false),
+	                 COALESCE(t.gold_check+0, 0), COALESCE(t.is_checked+0, 0),
 	                 COALESCE(t.sort_number, 0), t.message,
 	                 COALESCE(t.cool_time, 1),
-	                 COALESCE(t.more_reward_check, false), COALESCE(wc.more_reward_gold, 0)
+	                 COALESCE(t.more_reward_check+0, 0), COALESCE(wc.more_reward_gold, 0)
 	          FROM todov2 t
 	          LEFT JOIN content wc ON t.content_id = wc.content_id
 	          WHERE t.character_id IN ` + inClause + ` AND COALESCE(t.cool_time, 1) >= 1
@@ -1255,18 +1286,23 @@ func (s *CharacterService) buildTodoListBatch(ctx context.Context, characterIDs 
 		var charID int64
 		var t todoV2Row
 		var message sql.NullString
+		var goldCheckInt, isCheckedInt, moreRewardCheckInt int // BIT+0 returns int
 		err := rows.Scan(
 			&charID, &t.ID, &t.WeekCategory,
 			&t.WeekContentCategory, &t.Gate,
 			&t.Gold, &t.CharacterGold,
-			&t.GoldCheck, &t.IsChecked,
+			&goldCheckInt, &isCheckedInt,
 			&t.SortNumber, &message,
 			&t.CoolTime,
-			&t.MoreRewardCheck, &t.MoreRewardGold,
+			&moreRewardCheckInt, &t.MoreRewardGold,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("scanning todov2 batch: %w", err)
 		}
+		// Convert int to bool
+		t.GoldCheck = goldCheckInt != 0
+		t.IsChecked = isCheckedInt != 0
+		t.MoreRewardCheck = moreRewardCheckInt != 0
 		if message.Valid {
 			t.Message = &message.String
 		}
@@ -1286,7 +1322,17 @@ func (s *CharacterService) processTodoList(todoRows []todoV2Row, charClassName s
 	dtoMap := make(map[string]*TodoResponseDto)
 	var dtoOrder []string
 
+	// Also track weekContentCategory -> gates for building the name string
+	// Map: weekCategory -> (weekContentCategory -> []gate)
+	nameDataMap := make(map[string]map[string][]int)
+
 	for _, t := range todoRows {
+		// Track gate data for name building
+		if nameDataMap[t.WeekCategory] == nil {
+			nameDataMap[t.WeekCategory] = make(map[string][]int)
+		}
+		nameDataMap[t.WeekCategory][t.WeekContentCategory] = append(nameDataMap[t.WeekCategory][t.WeekContentCategory], t.Gate)
+
 		existing, ok := dtoMap[t.WeekCategory]
 		if !ok {
 			realGold := 0
@@ -1352,20 +1398,39 @@ func (s *CharacterService) processTodoList(todoRows []todoV2Row, charClassName s
 		}
 	}
 
-	// Apply RAID_CHECK_POLICY if applicable
+	// Apply RAID_CHECK_POLICY if applicable (only for todos where goldCheck is false)
 	if goldPolicy == "RAID_CHECK_POLICY" {
 		for _, dto := range dtoMap {
-			dto.RealGold -= dto.Gold
+			if !dto.GoldCheck {
+				dto.RealGold -= dto.Gold
+			}
 		}
 	}
 
-	// Build result in order, mark completed
+	// Build result in order, mark completed, and set Name
 	result := make([]TodoResponseDto, 0, len(dtoOrder))
 	for _, cat := range dtoOrder {
 		dto := dtoMap[cat]
 		if dto.CurrentGate == dto.TotalGate {
 			dto.Check = true
 		}
+
+		// Build Name string: "weekCategory <br />weekContentCategory gate1 gate2 ..."
+		// Format matches Spring Boot's buildResultString method
+		var nameBuilder strings.Builder
+		nameBuilder.WriteString(cat)
+		nameBuilder.WriteString(" <br />")
+		if contentMap, ok := nameDataMap[cat]; ok {
+			for contentCat, gates := range contentMap {
+				nameBuilder.WriteString(contentCat)
+				nameBuilder.WriteString(" ")
+				for _, gate := range gates {
+					nameBuilder.WriteString(fmt.Sprintf("%d ", gate))
+				}
+			}
+		}
+		dto.Name = nameBuilder.String()
+
 		result = append(result, *dto)
 	}
 

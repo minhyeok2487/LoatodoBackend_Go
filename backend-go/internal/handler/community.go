@@ -20,18 +20,32 @@ func (h *CommunityHandler) ListPosts(w http.ResponseWriter, r *http.Request) {
 	username := auth.GetUsername(r)
 	category := getQueryParam(r, "category")
 
-	// Validate category (Spring requires valid category)
-	validCategories := map[string]bool{
-		"일상": true, "깐부모집": true, "길드모집": true,
-		"고정팟모집": true, "로투두공지": true, "로투두건의사항": true,
+	// Validate category - accept both English enum names and Korean display names
+	// Map Korean to English enum for DB query (DB stores English enum values like LIFE, FRIENDS, etc.)
+	// Empty category means fetch all posts (like Spring)
+	categoryMap := map[string]string{
+		"LIFE": "LIFE", "FRIENDS": "FRIENDS", "GUILDS": "GUILDS",
+		"PARTIES": "PARTIES", "BOARDS": "BOARDS", "COMMENTS": "COMMENTS",
+		// Also accept Korean and map to English
+		"일상": "LIFE", "깐부모집": "FRIENDS", "길드모집": "GUILDS",
+		"고정팟모집": "PARTIES", "로투두공지": "BOARDS", "로투두건의사항": "COMMENTS",
 	}
-	if category == "" || !validCategories[category] {
-		writeError(w, http.StatusBadRequest, "유효하지 않은 카테고리입니다")
-		return
+	if category != "" {
+		mappedCategory, valid := categoryMap[category]
+		if !valid {
+			writeError(w, http.StatusBadRequest, "유효하지 않은 카테고리입니다")
+			return
+		}
+		category = mappedCategory
 	}
+	// If category is empty, fetch all posts (no category filter)
 
 	page := parseIntParam(getQueryParam(r, "page"))
+	// Support both "size" and "limit" params (Spring uses limit)
 	size := parseIntParam(getQueryParam(r, "size"))
+	if size <= 0 {
+		size = parseIntParam(getQueryParam(r, "limit"))
+	}
 	if size <= 0 {
 		size = 20
 	}

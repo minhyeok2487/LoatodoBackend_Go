@@ -26,11 +26,12 @@ type ServerTodoItem struct {
 	Custom          bool     `json:"custom"`
 }
 
-// ServerTodoState matches Spring's ServerTodoState entity response
+// ServerTodoState matches Spring's ServerTodoStateResponse
 type ServerTodoState struct {
-	StateID      int64  `json:"stateId"`
-	ServerTodoID int64  `json:"serverTodoId"`
-	Checked      bool   `json:"checked"`
+	TodoID     int64  `json:"todoId"`
+	ServerName string `json:"serverName"`
+	Enabled    bool   `json:"enabled"`
+	Checked    bool   `json:"checked"`
 }
 
 // ServerTodoListResponse matches Spring's response format
@@ -66,6 +67,24 @@ func (s *ServerTodoService) GetServerTodos(ctx context.Context, username string)
 	err := s.db.QueryRowContext(ctx, "SELECT member_id FROM member WHERE username = ?", username).Scan(&memberID)
 	if err != nil {
 		return nil, fmt.Errorf("member not found: %w", err)
+	}
+
+	// Get distinct server names from member's characters (matching Spring's extractServerNames)
+	serverRows, err := s.db.QueryContext(ctx,
+		`SELECT DISTINCT server_name FROM characters
+		 WHERE member_id = ? AND is_deleted = 0`, memberID)
+	if err != nil {
+		return nil, fmt.Errorf("querying server names: %w", err)
+	}
+	defer serverRows.Close()
+
+	var serverNames []string
+	for serverRows.Next() {
+		var serverName string
+		if err := serverRows.Scan(&serverName); err != nil {
+			return nil, fmt.Errorf("scanning server name: %w", err)
+		}
+		serverNames = append(serverNames, serverName)
 	}
 
 	// Get all server todos (without member_id filter for global todos, or for current user's custom todos)
@@ -138,24 +157,30 @@ func (s *ServerTodoService) GetServerTodos(ctx context.Context, username string)
 		}
 	}
 
-	// Get user's states
-	stateRows, err := s.db.QueryContext(ctx,
-		`SELECT server_todo_state_id, server_todo_id, checked
-		 FROM server_todo_state
-		 WHERE member_id = ?`,
-		memberID)
-	if err != nil {
-		return nil, fmt.Errorf("querying server todo states: %w", err)
-	}
-	defer stateRows.Close()
-
+	// Get user's states - only for servers where user has characters (matching Spring's behavior)
 	var states []ServerTodoState
-	for stateRows.Next() {
-		var st ServerTodoState
-		if err := stateRows.Scan(&st.StateID, &st.ServerTodoID, &st.Checked); err != nil {
-			return nil, fmt.Errorf("scanning server todo state: %w", err)
+	if len(serverNames) > 0 {
+		stateRows, err := s.db.QueryContext(ctx,
+			`SELECT server_todo_id, server_name, enabled+0, checked+0
+			 FROM server_todo_state
+			 WHERE member_id = ? AND server_name IN (`+placeholders(len(serverNames))+`)`,
+			append([]interface{}{memberID}, stringSliceToInterface(serverNames)...)...)
+		if err != nil {
+			return nil, fmt.Errorf("querying server todo states: %w", err)
 		}
-		states = append(states, st)
+		defer stateRows.Close()
+
+		for stateRows.Next() {
+			var st ServerTodoState
+			var enabledInt, checkedInt int // BIT+0 returns int
+			if err := stateRows.Scan(&st.TodoID, &st.ServerName, &enabledInt, &checkedInt); err != nil {
+				return nil, fmt.Errorf("scanning server todo state: %w", err)
+			}
+			// Convert int to bool
+			st.Enabled = enabledInt != 0
+			st.Checked = checkedInt != 0
+			states = append(states, st)
+		}
 	}
 
 	if todos == nil {
@@ -185,6 +210,15 @@ func int64SliceToInterface(ids []int64) []interface{} {
 	result := make([]interface{}, len(ids))
 	for i, id := range ids {
 		result[i] = id
+	}
+	return result
+}
+
+// stringSliceToInterface converts []string to []interface{} for SQL query
+func stringSliceToInterface(strs []string) []interface{} {
+	result := make([]interface{}, len(strs))
+	for i, s := range strs {
+		result[i] = s
 	}
 	return result
 }

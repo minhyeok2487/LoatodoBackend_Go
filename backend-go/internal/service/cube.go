@@ -17,13 +17,18 @@ func NewCubeService(db *sql.DB) *CubeService {
 
 type CubeResponse struct {
 	CubeID        int64   `json:"cubeId"`
+	CharacterID   int64   `json:"characterId"`
 	CharacterName string  `json:"characterName"`
+	ItemLevel     float64 `json:"itemLevel"`
 	Ban1          int     `json:"ban1"`
 	Ban2          int     `json:"ban2"`
 	Ban3          int     `json:"ban3"`
-	Jewelry       int     `json:"jewelry"`
-	LeapStone     int     `json:"leapStone"`
-	ShillingGold  float64 `json:"shillingGold"`
+	Ban4          int     `json:"ban4"`
+	Ban5          int     `json:"ban5"`
+	Unlock1       int     `json:"unlock1"`
+	Unlock2       int     `json:"unlock2"`
+	Unlock3       int     `json:"unlock3"`
+	Unlock4       int     `json:"unlock4"`
 }
 
 type CreateCubeRequest struct {
@@ -58,6 +63,21 @@ type CubeCalculation struct {
 	TotalProfit   float64 `json:"totalProfit"`
 }
 
+// CubeReward represents the reward table for each cube ticket tier
+type CubeReward struct {
+	Name           string `json:"name"`
+	Jewelry        int    `json:"jewelry"`
+	LeapStone      int    `json:"leapStone"`
+	Shilling       int    `json:"shilling"`
+	SolarGrace     int    `json:"solarGrace"`
+	SolarBlessing  int    `json:"solarBlessing"`
+	SolarProtection int   `json:"solarProtection"`
+	CardExp        int    `json:"cardExp"`
+	JewelryPrice   int    `json:"jewelryPrice"`
+	LavasBreath    int    `json:"lavasBreath"`
+	GlaciersBreath int    `json:"glaciersBreath"`
+}
+
 func (s *CubeService) GetCubeData(ctx context.Context, username string) ([]CubeResponse, error) {
 	var memberID int64
 	err := s.db.QueryRowContext(ctx, "SELECT member_id FROM member WHERE username = ?", username).Scan(&memberID)
@@ -66,7 +86,9 @@ func (s *CubeService) GetCubeData(ctx context.Context, username string) ([]CubeR
 	}
 
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT cu.cubes_id, c.character_name, cu.ban1, cu.ban2, cu.ban3
+		`SELECT cu.cubes_id, c.characters_id, c.character_name, c.item_level,
+		        cu.ban1, cu.ban2, cu.ban3, cu.ban4, cu.ban5,
+		        cu.unlock1, cu.unlock2, cu.unlock3, cu.unlock4
 		 FROM cubes cu
 		 JOIN characters c ON cu.character_id = c.characters_id
 		 WHERE c.member_id = ? AND (c.is_deleted IS NULL OR c.is_deleted = false)
@@ -80,7 +102,9 @@ func (s *CubeService) GetCubeData(ctx context.Context, username string) ([]CubeR
 	var cubes []CubeResponse
 	for rows.Next() {
 		var cube CubeResponse
-		if err := rows.Scan(&cube.CubeID, &cube.CharacterName, &cube.Ban1, &cube.Ban2, &cube.Ban3); err != nil {
+		if err := rows.Scan(&cube.CubeID, &cube.CharacterID, &cube.CharacterName, &cube.ItemLevel,
+			&cube.Ban1, &cube.Ban2, &cube.Ban3, &cube.Ban4, &cube.Ban5,
+			&cube.Unlock1, &cube.Unlock2, &cube.Unlock3, &cube.Unlock4); err != nil {
 			return nil, fmt.Errorf("scanning cube: %w", err)
 		}
 		cubes = append(cubes, cube)
@@ -120,6 +144,15 @@ func (s *CubeService) CreateOrUpdateCube(ctx context.Context, username string, r
 	now := time.Now()
 	_ = now
 
+	// Get character item level for the response
+	var itemLevel float64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT item_level FROM characters WHERE characters_id = ?`,
+		characterID).Scan(&itemLevel)
+	if err != nil {
+		itemLevel = 0.0 // Default if not found
+	}
+
 	if err == sql.ErrNoRows {
 		// Insert new cube
 		result, err := s.db.ExecContext(ctx,
@@ -137,10 +170,18 @@ func (s *CubeService) CreateOrUpdateCube(ctx context.Context, username string, r
 
 		return &CubeResponse{
 			CubeID:        id,
+			CharacterID:   characterID,
 			CharacterName: req.CharacterName,
+			ItemLevel:     itemLevel,
 			Ban1:          req.Ban1,
 			Ban2:          req.Ban2,
 			Ban3:          req.Ban3,
+			Ban4:          0,
+			Ban5:          0,
+			Unlock1:       0,
+			Unlock2:       0,
+			Unlock3:       0,
+			Unlock4:       0,
 		}, nil
 	} else if err != nil {
 		return nil, fmt.Errorf("checking existing cube: %w", err)
@@ -155,13 +196,23 @@ func (s *CubeService) CreateOrUpdateCube(ctx context.Context, username string, r
 		return nil, fmt.Errorf("updating cube: %w", err)
 	}
 
-	return &CubeResponse{
-		CubeID:        existingID,
-		CharacterName: req.CharacterName,
-		Ban1:          req.Ban1,
-		Ban2:          req.Ban2,
-		Ban3:          req.Ban3,
-	}, nil
+	// Fetch the full cube data to return
+	var cube CubeResponse
+	err = s.db.QueryRowContext(ctx,
+		`SELECT cu.cubes_id, c.characters_id, c.character_name, c.item_level,
+		        cu.ban1, cu.ban2, cu.ban3, cu.ban4, cu.ban5,
+		        cu.unlock1, cu.unlock2, cu.unlock3, cu.unlock4
+		 FROM cubes cu
+		 JOIN characters c ON cu.character_id = c.characters_id
+		 WHERE cu.cubes_id = ?`,
+		existingID).Scan(&cube.CubeID, &cube.CharacterID, &cube.CharacterName, &cube.ItemLevel,
+		&cube.Ban1, &cube.Ban2, &cube.Ban3, &cube.Ban4, &cube.Ban5,
+		&cube.Unlock1, &cube.Unlock2, &cube.Unlock3, &cube.Unlock4)
+	if err != nil {
+		return nil, fmt.Errorf("fetching updated cube: %w", err)
+	}
+
+	return &cube, nil
 }
 
 func (s *CubeService) DeleteCube(ctx context.Context, username string, cubeID int64) error {
@@ -287,4 +338,21 @@ func (s *CubeService) SpendCubeTicket(ctx context.Context, username string, char
 		time.Now(), characterID, memberID,
 	)
 	return err
+}
+
+// GetCubeStatistics returns the static cube reward table matching Spring's response
+func (s *CubeService) GetCubeStatistics(ctx context.Context) ([]CubeReward, error) {
+	// Static reward table matching Spring's CubeService.getCubeStatistics()
+	rewards := []CubeReward{
+		{Name: "1금제", Jewelry: 21, LeapStone: 20, Shilling: 79859, SolarGrace: 6, SolarBlessing: 3, SolarProtection: 1, CardExp: 3000, JewelryPrice: 13, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "2금제", Jewelry: 36, LeapStone: 14, Shilling: 100142, SolarGrace: 8, SolarBlessing: 4, SolarProtection: 2, CardExp: 9000, JewelryPrice: 13, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "3금제", Jewelry: 54, LeapStone: 25, Shilling: 110370, SolarGrace: 11, SolarBlessing: 6, SolarProtection: 2, CardExp: 12000, JewelryPrice: 13, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "4금제", Jewelry: 72, LeapStone: 14, Shilling: 120518, SolarGrace: 12, SolarBlessing: 7, SolarProtection: 3, CardExp: 13000, JewelryPrice: 13, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "5금제", Jewelry: 81, LeapStone: 25, Shilling: 129802, SolarGrace: 13, SolarBlessing: 8, SolarProtection: 4, CardExp: 13500, JewelryPrice: 13, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "1해금", Jewelry: 9, LeapStone: 14, Shilling: 140173, SolarGrace: 0, SolarBlessing: 0, SolarProtection: 0, CardExp: 14000, JewelryPrice: 126, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "2해금", Jewelry: 12, LeapStone: 25, Shilling: 151741, SolarGrace: 0, SolarBlessing: 0, SolarProtection: 0, CardExp: 14500, JewelryPrice: 126, LavasBreath: 0, GlaciersBreath: 0},
+		{Name: "3해금", Jewelry: 24, LeapStone: 32, Shilling: 161235, SolarGrace: 0, SolarBlessing: 0, SolarProtection: 0, CardExp: 15000, JewelryPrice: 126, LavasBreath: 6, GlaciersBreath: 6},
+		{Name: "4해금", Jewelry: 33, LeapStone: 41, Shilling: 0, SolarGrace: 0, SolarBlessing: 0, SolarProtection: 0, CardExp: 15500, JewelryPrice: 126, LavasBreath: 8, GlaciersBreath: 8},
+	}
+	return rewards, nil
 }

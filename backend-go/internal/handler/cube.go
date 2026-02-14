@@ -78,15 +78,15 @@ func (h *CubeHandler) UpdateCube(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"message": "cube updated"})
 }
 
-// CalculateProfits handles GET /api/v1/cube/calculate
+// CalculateProfits handles GET /api/v1/cube/statistics
+// Returns the static cube reward table matching Spring's response
 func (h *CubeHandler) CalculateProfits(w http.ResponseWriter, r *http.Request) {
-	username := auth.GetUsername(r)
-	calculations, err := h.svc.CalculateProfits(r.Context(), username)
+	rewards, err := h.svc.GetCubeStatistics(r.Context())
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, calculations)
+	writeJSON(w, http.StatusOK, rewards)
 }
 
 // SpendCubeTicket handles POST /api/v1/cube/spend

@@ -17,23 +17,24 @@ func NewCommunityService(db *sql.DB) *CommunityService {
 }
 
 type CommunityPostResponse struct {
-	CommunityID int64     `json:"communityId"`
-	Category    string    `json:"category"`
-	Title       string    `json:"title"`
-	Body        string    `json:"body"`
-	Username    string    `json:"username"`
-	LikeCount   int       `json:"likeCount"`
-	CommentCount int      `json:"commentCount"`
-	Liked       bool      `json:"liked"`
-	CreatedAt   time.Time `json:"createdAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	CommunityID        int64    `json:"communityId"`
+	CreatedDate        string   `json:"createdDate"`
+	CharacterClassName string   `json:"characterClassName"`
+	CharacterImage     string   `json:"characterImage"`
+	Name               string   `json:"name"`
+	MemberID           int64    `json:"memberId"`
+	Body               string   `json:"body"`
+	Category           string   `json:"category"`
+	MyPost             bool     `json:"myPost"`
+	LikeCount          int      `json:"likeCount"`
+	MyLike             bool     `json:"myLike"`
+	CommentCount       int      `json:"commentCount"`
+	ImageList          []string `json:"imageList"`
 }
 
 type CommunityListResponse struct {
-	Posts      []CommunityPostResponse `json:"posts"`
-	TotalCount int64                   `json:"totalCount"`
-	Page       int                     `json:"page"`
-	Size       int                     `json:"size"`
+	Content []CommunityPostResponse `json:"content"`
+	HasNext bool                    `json:"hasNext"`
 }
 
 type CreateCommunityRequest struct {
@@ -69,7 +70,7 @@ func (s *CommunityService) ListPosts(ctx context.Context, username string, categ
 		args = append(args, category)
 	}
 
-	// Count total
+	// Count total for hasNext calculation
 	var totalCount int64
 	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM community c %s", baseWhere)
 	err = s.db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount)
@@ -77,24 +78,28 @@ func (s *CommunityService) ListPosts(ctx context.Context, username string, categ
 		return nil, fmt.Errorf("게시글 수 조회 실패: %w", err)
 	}
 
-	// Paginated query
+	// Paginated query - include character info like Spring
 	offset := page * size
 	selectQuery := fmt.Sprintf(`
-		SELECT c.community_id, c.category, c.name, c.body, m.username,
+		SELECT c.community_id, c.created_date, c.member_id, c.name, c.body, c.category,
+		       COALESCE(ch.character_class_name, '') as character_class_name,
+		       COALESCE(ch.character_image, '') as character_image,
 		       (SELECT COUNT(*) FROM community_like WHERE community_id = c.community_id) as like_count,
-		       (SELECT COUNT(*) FROM comments WHERE community_id = c.community_id) as comment_count,
-		       EXISTS(SELECT 1 FROM community_like WHERE community_id = c.community_id AND member_id = ?) as liked,
-		       c.created_date, c.last_modified_date
+		       (SELECT COUNT(*) FROM community WHERE root_parent_id = c.community_id AND deleted = false) as comment_count,
+		       EXISTS(SELECT 1 FROM community_like WHERE community_id = c.community_id AND member_id = ?) as my_like,
+		       (c.member_id = ?) as my_post
 		FROM community c
-		JOIN member m ON c.member_id = m.member_id
+		LEFT JOIN characters ch ON ch.characters_id = (
+			SELECT characters_id FROM characters WHERE member_id = c.member_id AND (is_deleted IS NULL OR is_deleted = false) ORDER BY sort_number LIMIT 1
+		)
 		%s
 		ORDER BY c.created_date DESC
 		LIMIT ? OFFSET ?
 	`, baseWhere)
 
-	queryArgs := []interface{}{memberID}
+	queryArgs := []interface{}{memberID, memberID}
 	queryArgs = append(queryArgs, args...)
-	queryArgs = append(queryArgs, size, offset)
+	queryArgs = append(queryArgs, size+1, offset) // Fetch one extra to check hasNext
 
 	rows, err := s.db.QueryContext(ctx, selectQuery, queryArgs...)
 	if err != nil {
@@ -105,25 +110,64 @@ func (s *CommunityService) ListPosts(ctx context.Context, username string, categ
 	posts := []CommunityPostResponse{}
 	for rows.Next() {
 		var p CommunityPostResponse
+		var createdDate time.Time
 		if err := rows.Scan(
-			&p.CommunityID, &p.Category, &p.Title, &p.Body, &p.Username,
-			&p.LikeCount, &p.CommentCount, &p.Liked,
-			&p.CreatedAt, &p.UpdatedAt,
+			&p.CommunityID, &createdDate, &p.MemberID, &p.Name, &p.Body, &p.Category,
+			&p.CharacterClassName, &p.CharacterImage,
+			&p.LikeCount, &p.CommentCount, &p.MyLike, &p.MyPost,
 		); err != nil {
 			return nil, fmt.Errorf("게시글 스캔 실패: %w", err)
 		}
+		p.CreatedDate = createdDate.Format("2006-01-02T15:04:05.000000")
+		p.ImageList = []string{} // Initialize empty, will populate below
 		posts = append(posts, p)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("게시글 목록 반복 오류: %w", err)
 	}
 
+	// Calculate hasNext and trim extra item
+	hasNext := len(posts) > size
+	if hasNext {
+		posts = posts[:size]
+	}
+
+	// Fetch images for each post
+	for i := range posts {
+		images, err := s.getPostImages(ctx, posts[i].CommunityID)
+		if err == nil {
+			posts[i].ImageList = images
+		}
+	}
+
 	return &CommunityListResponse{
-		Posts:      posts,
-		TotalCount: totalCount,
-		Page:       page,
-		Size:       size,
+		Content: posts,
+		HasNext: hasNext,
 	}, nil
+}
+
+func (s *CommunityService) getPostImages(ctx context.Context, communityID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		"SELECT url FROM community_images WHERE community_id = ? AND deleted = false ORDER BY ordering ASC",
+		communityID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var images []string
+	for rows.Next() {
+		var url string
+		if err := rows.Scan(&url); err != nil {
+			return nil, err
+		}
+		images = append(images, url)
+	}
+	if images == nil {
+		images = []string{}
+	}
+	return images, rows.Err()
 }
 
 func (s *CommunityService) GetPost(ctx context.Context, username string, communityID int64) (*CommunityPostResponse, error) {
@@ -135,20 +179,25 @@ func (s *CommunityService) GetPost(ctx context.Context, username string, communi
 	}
 
 	query := `
-		SELECT c.community_id, c.category, c.name, c.body, m.username,
+		SELECT c.community_id, c.created_date, c.member_id, c.name, c.body, c.category,
+		       COALESCE(ch.character_class_name, '') as character_class_name,
+		       COALESCE(ch.character_image, '') as character_image,
 		       (SELECT COUNT(*) FROM community_like WHERE community_id = c.community_id) as like_count,
-		       (SELECT COUNT(*) FROM comments WHERE community_id = c.community_id) as comment_count,
-		       EXISTS(SELECT 1 FROM community_like WHERE community_id = c.community_id AND member_id = ?) as liked,
-		       c.created_date, c.last_modified_date
+		       (SELECT COUNT(*) FROM community WHERE root_parent_id = c.community_id AND deleted = false) as comment_count,
+		       EXISTS(SELECT 1 FROM community_like WHERE community_id = c.community_id AND member_id = ?) as my_like,
+		       (c.member_id = ?) as my_post
 		FROM community c
-		JOIN member m ON c.member_id = m.member_id
+		LEFT JOIN characters ch ON ch.characters_id = (
+			SELECT characters_id FROM characters WHERE member_id = c.member_id AND (is_deleted IS NULL OR is_deleted = false) ORDER BY sort_number LIMIT 1
+		)
 		WHERE c.community_id = ? AND c.deleted = false
 	`
 	var p CommunityPostResponse
-	err = s.db.QueryRowContext(ctx, query, memberID, communityID).Scan(
-		&p.CommunityID, &p.Category, &p.Title, &p.Body, &p.Username,
-		&p.LikeCount, &p.CommentCount, &p.Liked,
-		&p.CreatedAt, &p.UpdatedAt,
+	var createdDate time.Time
+	err = s.db.QueryRowContext(ctx, query, memberID, memberID, communityID).Scan(
+		&p.CommunityID, &createdDate, &p.MemberID, &p.Name, &p.Body, &p.Category,
+		&p.CharacterClassName, &p.CharacterImage,
+		&p.LikeCount, &p.CommentCount, &p.MyLike, &p.MyPost,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -156,16 +205,29 @@ func (s *CommunityService) GetPost(ctx context.Context, username string, communi
 		}
 		return nil, fmt.Errorf("게시글 조회 실패: %w", err)
 	}
+	p.CreatedDate = createdDate.Format("2006-01-02T15:04:05.000000")
+	p.ImageList, _ = s.getPostImages(ctx, communityID)
 
 	return &p, nil
 }
 
 func (s *CommunityService) CreatePost(ctx context.Context, username string, req CreateCommunityRequest) (*CommunityPostResponse, error) {
-	// Get member ID
+	// Get member ID and character info
 	var memberID int64
 	err := s.db.QueryRowContext(ctx, "SELECT member_id FROM member WHERE username = ?", username).Scan(&memberID)
 	if err != nil {
 		return nil, fmt.Errorf("회원을 찾을 수 없습니다: %w", err)
+	}
+
+	// Get character info
+	var characterClassName, characterImage string
+	err = s.db.QueryRowContext(ctx,
+		`SELECT COALESCE(character_class_name, ''), COALESCE(character_image, '')
+		 FROM characters WHERE member_id = ? AND (is_deleted IS NULL OR is_deleted = false)
+		 ORDER BY sort_number LIMIT 1`,
+		memberID).Scan(&characterClassName, &characterImage)
+	if err != nil && err != sql.ErrNoRows {
+		return nil, fmt.Errorf("캐릭터 조회 실패: %w", err)
 	}
 
 	now := time.Now()
@@ -184,16 +246,19 @@ func (s *CommunityService) CreatePost(ctx context.Context, username string, req 
 	}
 
 	return &CommunityPostResponse{
-		CommunityID:  postID,
-		Category:     req.Category,
-		Title:        req.Title,
-		Body:         req.Body,
-		Username:     username,
-		LikeCount:    0,
-		CommentCount: 0,
-		Liked:        false,
-		CreatedAt:    now,
-		UpdatedAt:    now,
+		CommunityID:        postID,
+		CreatedDate:        now.Format("2006-01-02T15:04:05.000000"),
+		CharacterClassName: characterClassName,
+		CharacterImage:     characterImage,
+		Name:               req.Title,
+		MemberID:           memberID,
+		Body:               req.Body,
+		Category:           req.Category,
+		MyPost:             true,
+		LikeCount:          0,
+		MyLike:             false,
+		CommentCount:       0,
+		ImageList:          []string{},
 	}, nil
 }
 
