@@ -263,47 +263,180 @@ func (s *CharacterDayService) CheckAllDayContent(ctx context.Context, username s
 	}, nil
 }
 
+// DayCheckAllCharactersResponse is the response for checking all characters on a server.
+type DayCheckAllCharactersResponse struct {
+	ServerName string  `json:"serverName"`
+	Done       bool    `json:"done"`
+	Profit     float64 `json:"profit"`
+}
+
 // CheckAllDayCharacters checks all daily content for all characters on a server.
-func (s *CharacterDayService) CheckAllDayCharacters(ctx context.Context, username string, req DayCheckAllCharactersRequest) error {
+func (s *CharacterDayService) CheckAllDayCharacters(ctx context.Context, username string, req DayCheckAllCharactersRequest) (*DayCheckAllCharactersResponse, error) {
 	var memberID int64
 	err := s.db.QueryRowContext(ctx,
 		"SELECT member_id FROM member WHERE username = ?", username,
 	).Scan(&memberID)
 	if err != nil {
-		return fmt.Errorf("querying member: %w", err)
+		return nil, fmt.Errorf("querying member: %w", err)
 	}
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT characters_id FROM characters
-		 WHERE member_id = ? AND server_name = ?
-		   AND is_deleted = false`,
-		memberID, req.ServerName,
-	)
+	// Build server filter - "전체" means all servers
+	var rows *sql.Rows
+	if req.ServerName == "전체" {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT characters_id, chaos_check, guardian_check, epona_check2,
+			        show_chaos, show_guardian, show_epona, show_character
+			 FROM characters
+			 WHERE member_id = ? AND is_deleted = false`,
+			memberID,
+		)
+	} else {
+		rows, err = s.db.QueryContext(ctx,
+			`SELECT characters_id, chaos_check, guardian_check, epona_check2,
+			        show_chaos, show_guardian, show_epona, show_character
+			 FROM characters
+			 WHERE member_id = ? AND server_name = ? AND is_deleted = false`,
+			memberID, req.ServerName,
+		)
+	}
 	if err != nil {
-		return fmt.Errorf("querying characters: %w", err)
+		return nil, fmt.Errorf("querying characters: %w", err)
 	}
 	defer rows.Close()
 
-	var charIDs []int64
+	type charInfo struct {
+		id            int64
+		chaosCheck    int
+		guardianCheck int
+		eponaCheck    int
+		showChaos     bool
+		showGuardian  bool
+		showEpona     bool
+		showCharacter bool
+	}
+
+	var chars []charInfo
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
-			return fmt.Errorf("scanning character id: %w", err)
+		var c charInfo
+		var showChaos, showGuardian, showEpona, showCharacter []byte
+		if err := rows.Scan(&c.id, &c.chaosCheck, &c.guardianCheck, &c.eponaCheck,
+			&showChaos, &showGuardian, &showEpona, &showCharacter); err != nil {
+			return nil, fmt.Errorf("scanning character: %w", err)
 		}
-		charIDs = append(charIDs, id)
+		c.showChaos = len(showChaos) > 0 && showChaos[0] == 1
+		c.showGuardian = len(showGuardian) > 0 && showGuardian[0] == 1
+		c.showEpona = len(showEpona) > 0 && showEpona[0] == 1
+		c.showCharacter = len(showCharacter) > 0 && showCharacter[0] == 1
+		chars = append(chars, c)
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 
-	for _, charID := range charIDs {
-		_, err := s.CheckAllDayContent(ctx, username, DayCheckAllRequest{CharacterID: charID})
-		if err != nil {
-			return fmt.Errorf("checking character %d: %w", charID, err)
+	// Check if all displayed content is already done
+	allCompleted := true
+	for _, c := range chars {
+		if !c.showCharacter {
+			continue
+		}
+		if c.showChaos && c.chaosCheck != 2 {
+			allCompleted = false
+			break
+		}
+		if c.showGuardian && c.guardianCheck < 1 {
+			allCompleted = false
+			break
+		}
+		if c.showEpona && c.eponaCheck < 3 {
+			allCompleted = false
+			break
 		}
 	}
 
-	return nil
+	// Process all displayed characters
+	var profit float64
+	for _, c := range chars {
+		if !c.showCharacter {
+			continue
+		}
+		result, err := s.CheckAllDayContentWithToggle(ctx, username, c.id, allCompleted)
+		if err != nil {
+			return nil, fmt.Errorf("checking character %d: %w", c.id, err)
+		}
+		profit += result.WeekTotalGold
+	}
+
+	return &DayCheckAllCharactersResponse{
+		ServerName: req.ServerName,
+		Done:       allCompleted,
+		Profit:     profit,
+	}, nil
+}
+
+// CheckAllDayContentWithToggle checks all daily content with optional toggle off.
+func (s *CharacterDayService) CheckAllDayContentWithToggle(ctx context.Context, username string, charID int64, toggleOff bool) (*DayTodoResult, error) {
+	d, err := s.loadDayTodo(ctx, charID)
+	if err != nil {
+		return nil, err
+	}
+
+	if toggleOff {
+		// Toggle off - reset all checks
+		d.ChaosCheck = 0
+		d.ChaosGauge = d.BeforeChaosGauge
+		d.GuardianCheck = 0
+		d.GuardianGauge = d.BeforeGuardianGauge
+		d.EponaCheck = 0
+		d.EponaGauge = d.BeforeEponaGauge
+		d.WeekTotalGold = 0
+	} else {
+		// Toggle on - check all
+		if d.ChaosCheck != 2 {
+			d.ChaosCheck, d.ChaosGauge, d.WeekTotalGold = updateCheckChaos(
+				d.ChaosCheck, d.ChaosGauge, d.BeforeChaosGauge,
+				d.ChaosGold, d.WeekTotalGold,
+			)
+		}
+		if d.GuardianCheck < 1 {
+			d.GuardianCheck, d.GuardianGauge, d.WeekTotalGold = updateCheckGuardian(
+				d.GuardianCheck, d.GuardianGauge, d.BeforeGuardianGauge,
+				d.GuardianGold, d.WeekTotalGold,
+			)
+		}
+		for d.EponaCheck < 3 {
+			d.EponaCheck, d.EponaGauge = updateCheckEpona(
+				d.EponaCheck, d.EponaGauge, d.BeforeEponaGauge,
+			)
+		}
+	}
+
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE characters
+		 SET chaos_check = ?, chaos_gauge = ?,
+		     guardian_check = ?, guardian_gauge = ?,
+		     epona_check2 = ?, epona_gauge = ?,
+		     week_total_gold = ?, last_modified_date = ?
+		 WHERE characters_id = ?`,
+		d.ChaosCheck, d.ChaosGauge,
+		d.GuardianCheck, d.GuardianGauge,
+		d.EponaCheck, d.EponaGauge,
+		d.WeekTotalGold, time.Now(), charID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("updating all day content: %w", err)
+	}
+
+	return &DayTodoResult{
+		ChaosCheck:    d.ChaosCheck,
+		ChaosGauge:    d.ChaosGauge,
+		ChaosGold:     d.ChaosGold,
+		GuardianCheck: d.GuardianCheck,
+		GuardianGauge: d.GuardianGauge,
+		GuardianGold:  d.GuardianGold,
+		EponaCheck:    d.EponaCheck,
+		EponaGauge:    d.EponaGauge,
+		WeekTotalGold: d.WeekTotalGold,
+	}, nil
 }
 
 // --- Business Logic Functions (ported from Java) ---

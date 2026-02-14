@@ -107,7 +107,7 @@ func (s *MemberService) GetMember(ctx context.Context, username string) (*Member
 		err = s.db.QueryRowContext(ctx,
 			`SELECT server_name, character_name, character_image, character_class_name, item_level
 			 FROM characters
-			 WHERE member_id = ? AND character_name = ? AND (is_deleted IS NULL OR is_deleted = false)`,
+			 WHERE member_id = ? AND character_name = ? AND COALESCE(is_deleted, 0) = 0`,
 			memberID, mainCharName.String,
 		).Scan(&serverName, &charName, &charImage, &charClass, &itemLevel)
 

@@ -22,15 +22,20 @@ type AnalysisResponse struct {
 	CreatedAt time.Time `json:"createdAt"`
 }
 
+type AnalysisListResponse struct {
+	Content []AnalysisResponse `json:"content"`
+	HasNext bool               `json:"hasNext"`
+}
+
 type CreateAnalysisRequest struct {
 	Content string `json:"content"`
 }
 
-func (s *AnalysisService) GetAnalyses(ctx context.Context, username string) ([]AnalysisResponse, error) {
+func (s *AnalysisService) GetAnalyses(ctx context.Context, username string) (*AnalysisListResponse, error) {
 	var memberID int64
 	err := s.db.QueryRowContext(ctx, "SELECT member_id FROM member WHERE username = ?", username).Scan(&memberID)
 	if err != nil {
-		return nil, fmt.Errorf("querying member: %w", err)
+		return &AnalysisListResponse{Content: []AnalysisResponse{}, HasNext: false}, nil
 	}
 
 	rows, err := s.db.QueryContext(ctx,
@@ -38,7 +43,7 @@ func (s *AnalysisService) GetAnalyses(ctx context.Context, username string) ([]A
 		 WHERE member_id = ? ORDER BY created_date DESC LIMIT 100`, memberID,
 	)
 	if err != nil {
-		return []AnalysisResponse{}, nil
+		return &AnalysisListResponse{Content: []AnalysisResponse{}, HasNext: false}, nil
 	}
 	defer rows.Close()
 
@@ -46,14 +51,14 @@ func (s *AnalysisService) GetAnalyses(ctx context.Context, username string) ([]A
 	for rows.Next() {
 		var a AnalysisResponse
 		if err := rows.Scan(&a.ID, &a.MemberID, &a.Content, &a.CreatedAt); err != nil {
-			return []AnalysisResponse{}, nil
+			return &AnalysisListResponse{Content: []AnalysisResponse{}, HasNext: false}, nil
 		}
 		analyses = append(analyses, a)
 	}
 	if analyses == nil {
 		analyses = []AnalysisResponse{}
 	}
-	return analyses, rows.Err()
+	return &AnalysisListResponse{Content: analyses, HasNext: false}, rows.Err()
 }
 
 func (s *AnalysisService) CreateAnalysis(ctx context.Context, username string, req CreateAnalysisRequest) (*AnalysisResponse, error) {

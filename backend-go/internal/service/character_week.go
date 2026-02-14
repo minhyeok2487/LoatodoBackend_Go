@@ -211,14 +211,22 @@ func (s *CharacterWeekService) GetWeekRaidForm(ctx context.Context, username str
 	}
 
 	// Get all week content that matches the character's item level
+	// Spring filter: level <= itemLevel AND coolTime <= 2
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT wc.content_id, wc.week_category, wc.name,
 		        COALESCE(wc.gate, 0), COALESCE(wc.gold, 0),
 		        COALESCE(wc.level, 0), COALESCE(wc.week_content_category, ''),
 		        COALESCE(wc.cool_time, 1), COALESCE(wc.character_gold, 0)
 		 FROM content wc
-		 WHERE wc.dtype = 'WeekContent' AND wc.level <= ?
-		 ORDER BY wc.level DESC, wc.week_category, wc.gate`, itemLevel,
+		 WHERE wc.dtype = 'WeekContent' AND wc.level <= ? AND COALESCE(wc.cool_time, 1) <= 2
+		 ORDER BY wc.level DESC,
+		          CASE wc.week_content_category
+		              WHEN '싱글' THEN 1
+		              WHEN '노말' THEN 2
+		              WHEN '하드' THEN 3
+		              ELSE 4
+		          END ASC,
+		          wc.gate ASC`, itemLevel,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("querying week content: %w", err)

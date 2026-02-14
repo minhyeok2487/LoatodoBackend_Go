@@ -121,10 +121,11 @@ func (h *CharacterDayHandler) CheckAllDayCharacters(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if err := h.dayService.CheckAllDayCharacters(r.Context(), username, req); err != nil {
+	resp, err := h.dayService.CheckAllDayCharacters(r.Context(), username, req)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"message": "ok"})
+	writeJSON(w, http.StatusOK, resp)
 }

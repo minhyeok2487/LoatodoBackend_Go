@@ -44,8 +44,15 @@ type UpdateScheduleRequest struct {
 }
 
 type RaidCategoryResponse struct {
-	Name       string   `json:"name"`
-	RaidNames  []string `json:"raidNames"`
+	CategoryID          int64   `json:"categoryId"`
+	Name                string  `json:"name"`
+	WeekContentCategory string  `json:"weekContentCategory"`
+	Level               float64 `json:"level"`
+}
+
+type RaidCategoryGroupResponse struct {
+	Name      string   `json:"name"`
+	RaidNames []string `json:"raidNames"`
 }
 
 type ScheduleCharacter struct {
@@ -290,59 +297,35 @@ func (s *ScheduleService) DeleteSchedule(ctx context.Context, username string, s
 
 func (s *ScheduleService) GetRaidCategories(ctx context.Context) ([]RaidCategoryResponse, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT COALESCE(week_category, '') AS wc, COALESCE(name, '') AS n
+		`SELECT content_id, COALESCE(name, '') AS name,
+		        COALESCE(week_content_category, '') AS week_content_category,
+		        COALESCE(level, 0) AS level
 		 FROM content
 		 WHERE dtype = 'WeekContent'
-		 ORDER BY week_category, level DESC`,
+		   AND week_content_category IS NOT NULL
+		   AND week_content_category != ''
+		   AND gate = 1
+		 ORDER BY level DESC`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("query raid categories: %w", err)
 	}
 	defer rows.Close()
 
-	// Group by week_category, preserving order
-	categoryMap := make(map[string]*RaidCategoryResponse)
-	var categoryOrder []string
-
+	var result []RaidCategoryResponse
 	for rows.Next() {
-		var weekCategory, raidName string
-		if err := rows.Scan(&weekCategory, &raidName); err != nil {
+		var rc RaidCategoryResponse
+		if err := rows.Scan(&rc.CategoryID, &rc.Name, &rc.WeekContentCategory, &rc.Level); err != nil {
 			return nil, err
 		}
-		if weekCategory == "" {
-			continue
-		}
-
-		existing, ok := categoryMap[weekCategory]
-		if !ok {
-			resp := &RaidCategoryResponse{
-				Name:      weekCategory,
-				RaidNames: []string{},
-			}
-			categoryMap[weekCategory] = resp
-			categoryOrder = append(categoryOrder, weekCategory)
-			existing = resp
-		}
-
-		// Avoid duplicate raid names within the same category
-		found := false
-		for _, n := range existing.RaidNames {
-			if n == raidName {
-				found = true
-				break
-			}
-		}
-		if !found && raidName != "" {
-			existing.RaidNames = append(existing.RaidNames, raidName)
-		}
+		result = append(result, rc)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 
-	result := make([]RaidCategoryResponse, 0, len(categoryOrder))
-	for _, cat := range categoryOrder {
-		result = append(result, *categoryMap[cat])
+	if result == nil {
+		result = []RaidCategoryResponse{}
 	}
 	return result, nil
 }

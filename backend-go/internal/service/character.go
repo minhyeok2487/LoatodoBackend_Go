@@ -425,10 +425,17 @@ func (s *CharacterService) UpdateSingleCharacter(ctx context.Context, username s
 
 	var combatPower sql.NullFloat64
 	if profile.CombatPower != "" {
-		cp, _ := (&client.CharacterJsonDto{CombatPower: profile.CombatPower}).ParseCombatPower()
+		cp, parseErr := (&client.CharacterJsonDto{CombatPower: profile.CombatPower}).ParseCombatPower()
+		if parseErr != nil {
+			return nil, fmt.Errorf("parsing combat power '%s': %w", profile.CombatPower, parseErr)
+		}
 		if cp > 0 {
 			combatPower = sql.NullFloat64{Float64: cp, Valid: true}
 		}
+	}
+	// If combatPower is still not valid, use existing value from character
+	if !combatPower.Valid && char.CombatPower.Valid {
+		combatPower = char.CombatPower
 	}
 
 	var charImage sql.NullString
@@ -510,15 +517,83 @@ func (s *CharacterService) ChangeCharacterName(ctx context.Context, username str
 
 // AddCharacter adds a new character to the member.
 func (s *CharacterService) AddCharacter(ctx context.Context, username string, req AddCharacterRequest) (*CharacterResponse, error) {
+	// 1. Get member info including API key
 	var memberID int64
+	var apiKey sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		"SELECT member_id FROM member WHERE username = ?", username,
-	).Scan(&memberID)
+		"SELECT member_id, api_key FROM member WHERE username = ?", username,
+	).Scan(&memberID, &apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("querying member: %w", err)
 	}
+	if !apiKey.Valid || apiKey.String == "" {
+		return nil, errors.New("API Key가 등록되지 않았습니다.")
+	}
 
-	// Get max sort number
+	// 2. Check for duplicate character name
+	var existingCount int
+	err = s.db.QueryRowContext(ctx,
+		"SELECT COUNT(*) FROM characters WHERE member_id = ? AND character_name = ?",
+		memberID, req.CharacterName,
+	).Scan(&existingCount)
+	if err != nil {
+		return nil, fmt.Errorf("checking duplicate character: %w", err)
+	}
+	if existingCount > 0 {
+		return nil, errors.New("이미 등록된 캐릭터 이름입니다. 삭제된 캐릭터도 확인해주세요.")
+	}
+
+	// 3. Get character info from Lostark API
+	profile, err := s.charClient.GetCharacterProfile(req.CharacterName, apiKey.String)
+	if err != nil {
+		return nil, fmt.Errorf("fetching character from Lostark API: %w", err)
+	}
+
+	// Parse item level
+	itemLevel := 0.0
+	if profile.ItemAvgLevel != "" {
+		parsed, _ := (&client.CharacterJsonDto{ItemAvgLevel: profile.ItemAvgLevel}).ParseItemLevel()
+		if parsed >= 1415.0 {
+			itemLevel = parsed
+		}
+	}
+	if itemLevel < 1415.0 {
+		return nil, errors.New("아이템 레벨 1415 이상 캐릭터만 등록 가능합니다.")
+	}
+
+	// Parse combat power
+	var combatPower sql.NullFloat64
+	if profile.CombatPower != "" {
+		cp, _ := (&client.CharacterJsonDto{CombatPower: profile.CombatPower}).ParseCombatPower()
+		if cp > 0 {
+			combatPower = sql.NullFloat64{Float64: cp, Valid: true}
+		}
+	}
+
+	// Get character image
+	var charImage sql.NullString
+	if profile.CharacterImage != nil {
+		charImage = sql.NullString{String: *profile.CharacterImage, Valid: true}
+	}
+
+	// 4. Find content IDs based on item level
+	var chaosID, guardianID sql.NullInt64
+	err = s.db.QueryRowContext(ctx,
+		`SELECT content_id FROM content WHERE dtype = 'DayContent' AND category = '카오스던전' AND level <= ? ORDER BY level DESC LIMIT 1`,
+		itemLevel,
+	).Scan(&chaosID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("querying chaos content: %w", err)
+	}
+	err = s.db.QueryRowContext(ctx,
+		`SELECT content_id FROM content WHERE dtype = 'DayContent' AND category = '가디언토벌' AND level <= ? ORDER BY level DESC LIMIT 1`,
+		itemLevel,
+	).Scan(&guardianID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("querying guardian content: %w", err)
+	}
+
+	// 5. Get max sort number
 	var maxSort sql.NullInt64
 	err = s.db.QueryRowContext(ctx,
 		"SELECT MAX(sort_number) FROM characters WHERE member_id = ?", memberID,
@@ -532,23 +607,55 @@ func (s *CharacterService) AddCharacter(ctx context.Context, username string, re
 		nextSort = int(maxSort.Int64) + 1
 	}
 
+	// 6. Insert character with full data (all NOT NULL fields must be included)
 	now := time.Now()
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO characters (member_id, character_name, sort_number, gold_character,
-		 challenge_guardian, challenge_abyss, is_deleted, created_date, last_modified_date)
-		 VALUES (?, ?, ?, false, false, false, false, ?, ?)`,
-		memberID, req.CharacterName, nextSort, now, now,
+		`INSERT INTO characters (
+			member_id, server_name, character_name, character_level,
+			character_class_name, character_image, item_level, combat_power,
+			sort_number, gold_character, challenge_guardian, challenge_abyss,
+			chaos_id, guardian_id, is_deleted, created_date, last_modified_date,
+			before_chaos_gauge, before_epona_gauge, before_guardian_gauge,
+			chaos_check, chaos_gauge, chaos_gold,
+			epona_check2, epona_gauge,
+			guardian_check, guardian_gauge, guardian_gold,
+			week_total_gold, cube_ticket, silmael_change, week_epona, elysian_count
+		) VALUES (
+			?, ?, ?, ?,
+			?, ?, ?, ?,
+			?, false, false, false,
+			?, ?, false, ?, ?,
+			0, 0, 0,
+			0, 0, 0,
+			0, 0,
+			0, 0, 0,
+			0, 0, false, 0, 0
+		)`,
+		memberID, profile.ServerName, profile.CharacterName, profile.CharacterLevel,
+		profile.CharacterClassName, charImage, itemLevel, combatPower,
+		nextSort,
+		chaosID, guardianID, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("inserting character: %w", err)
 	}
 
 	id, _ := result.LastInsertId()
-	return &CharacterResponse{
-		CharacterID:   id,
-		CharacterName: req.CharacterName,
-		SortNumber:    nextSort,
-	}, nil
+	resp := &CharacterResponse{
+		CharacterID:        id,
+		ServerName:         profile.ServerName,
+		CharacterName:      profile.CharacterName,
+		CharacterClassName: profile.CharacterClassName,
+		ItemLevel:          itemLevel,
+		SortNumber:         nextSort,
+	}
+	if charImage.Valid {
+		resp.CharacterImage = &charImage.String
+	}
+	if combatPower.Valid {
+		resp.CombatPower = combatPower.Float64
+	}
+	return resp, nil
 }
 
 // GetCharacterList returns the full character list with todo info for a member.

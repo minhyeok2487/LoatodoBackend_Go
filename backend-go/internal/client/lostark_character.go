@@ -114,9 +114,17 @@ func (c *LostarkCharacterClient) GetCharacterProfile(characterName, apiKey strin
 		return nil, fmt.Errorf("fetching profile: %w", err)
 	}
 
+	if len(body) == 0 || string(body) == "null" {
+		return nil, fmt.Errorf("캐릭터를 찾을 수 없습니다. (인게임에서 한번 접속해주세요.)")
+	}
+
 	var profile CharacterProfile
 	if err := json.Unmarshal(body, &profile); err != nil {
 		return nil, fmt.Errorf("parsing profile response: %w", err)
+	}
+
+	if profile.CharacterName == "" {
+		return nil, fmt.Errorf("캐릭터를 찾을 수 없습니다. (인게임에서 한번 접속해주세요.)")
 	}
 
 	return &profile, nil
