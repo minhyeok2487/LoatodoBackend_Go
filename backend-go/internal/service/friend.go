@@ -8,6 +8,11 @@ import (
 	"time"
 )
 
+// bitToBool converts MySQL BIT(1)/TINYINT(1) to bool
+func bitToBool(b []byte) bool {
+	return len(b) > 0 && b[0] == 1
+}
+
 type FriendService struct {
 	db *sql.DB
 }
@@ -120,8 +125,23 @@ type FriendSortRequest struct {
 	FriendIDList []int64 `json:"friendIdList"`
 }
 
+// friendRecord holds data from the friends table for batch processing
+type friendRecord struct {
+	FriendID       int64
+	FriendUsername string
+	AreWeFriend    bool
+	Ordering       int
+	Settings       FriendSettings
+}
+
+// reverseRecord holds reverse friendship data
+type reverseRecord struct {
+	AreWeFriend bool
+	Settings    FriendSettings
+}
+
 // GetFriends returns the friend list for a member.
-// Java: friendsService.get(member.getId()) using findFriendshipPairs.
+// Optimized: Uses batch queries to avoid N+1 problem.
 func (s *FriendService) GetFriends(ctx context.Context, username string) ([]FriendsResponse, error) {
 	// 1. Get member by username
 	var memberID int64
@@ -130,92 +150,160 @@ func (s *FriendService) GetFriends(ctx context.Context, username string) ([]Frie
 		return nil, fmt.Errorf("회원을 찾을 수 없습니다: %w", err)
 	}
 
-	// 2. Query all friend records for this member
+	// 2. Query all friend records for this member (my -> friend direction)
 	query := `
 		SELECT f.friends_id, m2.username, f.are_we_friend, f.ordering,
 		       f.show_day_todo, f.show_raid, f.show_week_todo,
 		       f.check_day_todo, f.check_raid, f.check_week_todo,
 		       f.update_gauge, f.update_raid, f.setting
 		FROM friends f
-		JOIN member m1 ON f.member_id = m1.member_id
 		JOIN member m2 ON f.from_member = m2.member_id
-		WHERE m1.username = ?
+		WHERE f.member_id = ?
 		ORDER BY f.ordering ASC
 	`
-	rows, err := s.db.QueryContext(ctx, query, username)
+	rows, err := s.db.QueryContext(ctx, query, memberID)
 	if err != nil {
 		return nil, fmt.Errorf("친구 목록 조회 실패: %w", err)
 	}
 	defer rows.Close()
 
-	var results []FriendsResponse
+	var friends []friendRecord
+	var friendUsernames []string
 	for rows.Next() {
 		var (
 			friendID       int64
 			friendUsername string
-			areWeFriend    bool
+			areWeFriendRaw []byte
 			ordering       int
-			toSettings     FriendSettings
+			showDayTodo, showRaid, showWeekTodo       []byte
+			checkDayTodo, checkRaid, checkWeekTodo    []byte
+			updateGauge, updateRaid, setting          []byte
 		)
 		if err := rows.Scan(
-			&friendID, &friendUsername, &areWeFriend, &ordering,
-			&toSettings.ShowDayTodo, &toSettings.ShowRaid, &toSettings.ShowWeekTodo,
-			&toSettings.CheckDayTodo, &toSettings.CheckRaid, &toSettings.CheckWeekTodo,
-			&toSettings.UpdateGauge, &toSettings.UpdateRaid, &toSettings.Setting,
+			&friendID, &friendUsername, &areWeFriendRaw, &ordering,
+			&showDayTodo, &showRaid, &showWeekTodo,
+			&checkDayTodo, &checkRaid, &checkWeekTodo,
+			&updateGauge, &updateRaid, &setting,
 		); err != nil {
 			return nil, fmt.Errorf("친구 목록 스캔 실패: %w", err)
 		}
 
-		// 3. Get the reverse record to determine friendship status and fromSettings
-		var reverseAreWeFriend bool
-		var fromSettings FriendSettings
-		reverseQuery := `
-			SELECT f.are_we_friend,
-			       f.show_day_todo, f.show_raid, f.show_week_todo,
-			       f.check_day_todo, f.check_raid, f.check_week_todo,
-			       f.update_gauge, f.update_raid, f.setting
-			FROM friends f
-			JOIN member m1 ON f.member_id = m1.member_id
-			JOIN member m2 ON f.from_member = m2.member_id
-			WHERE m1.username = ? AND m2.username = ?
-		`
-		err := s.db.QueryRowContext(ctx, reverseQuery, friendUsername, username).Scan(
-			&reverseAreWeFriend,
-			&fromSettings.ShowDayTodo, &fromSettings.ShowRaid, &fromSettings.ShowWeekTodo,
-			&fromSettings.CheckDayTodo, &fromSettings.CheckRaid, &fromSettings.CheckWeekTodo,
-			&fromSettings.UpdateGauge, &fromSettings.UpdateRaid, &fromSettings.Setting,
+		friends = append(friends, friendRecord{
+			FriendID:       friendID,
+			FriendUsername: friendUsername,
+			AreWeFriend:    bitToBool(areWeFriendRaw),
+			Ordering:       ordering,
+			Settings: FriendSettings{
+				ShowDayTodo:   bitToBool(showDayTodo),
+				ShowRaid:      bitToBool(showRaid),
+				ShowWeekTodo:  bitToBool(showWeekTodo),
+				CheckDayTodo:  bitToBool(checkDayTodo),
+				CheckRaid:     bitToBool(checkRaid),
+				CheckWeekTodo: bitToBool(checkWeekTodo),
+				UpdateGauge:   bitToBool(updateGauge),
+				UpdateRaid:    bitToBool(updateRaid),
+				Setting:       bitToBool(setting),
+			},
+		})
+		friendUsernames = append(friendUsernames, friendUsername)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("친구 목록 반복 오류: %w", err)
+	}
+
+	if len(friends) == 0 {
+		return []FriendsResponse{}, nil
+	}
+
+	// 3. Batch query: Get all reverse records in one query (friend -> me direction)
+	reverseMap := make(map[string]reverseRecord)
+	reverseQuery := `
+		SELECT m1.username, f.are_we_friend,
+		       f.show_day_todo, f.show_raid, f.show_week_todo,
+		       f.check_day_todo, f.check_raid, f.check_week_todo,
+		       f.update_gauge, f.update_raid, f.setting
+		FROM friends f
+		JOIN member m1 ON f.member_id = m1.member_id
+		WHERE f.from_member = ?
+	`
+	reverseRows, err := s.db.QueryContext(ctx, reverseQuery, memberID)
+	if err != nil {
+		return nil, fmt.Errorf("역방향 친구 조회 실패: %w", err)
+	}
+	defer reverseRows.Close()
+
+	for reverseRows.Next() {
+		var (
+			friendUsername string
+			areWeFriendRaw []byte
+			showDayTodo, showRaid, showWeekTodo       []byte
+			checkDayTodo, checkRaid, checkWeekTodo    []byte
+			updateGauge, updateRaid, setting          []byte
 		)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return nil, fmt.Errorf("역방향 친구 조회 실패: %w", err)
+		if err := reverseRows.Scan(
+			&friendUsername, &areWeFriendRaw,
+			&showDayTodo, &showRaid, &showWeekTodo,
+			&checkDayTodo, &checkRaid, &checkWeekTodo,
+			&updateGauge, &updateRaid, &setting,
+		); err != nil {
+			return nil, fmt.Errorf("역방향 친구 스캔 실패: %w", err)
 		}
+
+		reverseMap[friendUsername] = reverseRecord{
+			AreWeFriend: bitToBool(areWeFriendRaw),
+			Settings: FriendSettings{
+				ShowDayTodo:   bitToBool(showDayTodo),
+				ShowRaid:      bitToBool(showRaid),
+				ShowWeekTodo:  bitToBool(showWeekTodo),
+				CheckDayTodo:  bitToBool(checkDayTodo),
+				CheckRaid:     bitToBool(checkRaid),
+				CheckWeekTodo: bitToBool(checkWeekTodo),
+				UpdateGauge:   bitToBool(updateGauge),
+				UpdateRaid:    bitToBool(updateRaid),
+				Setting:       bitToBool(setting),
+			},
+		}
+	}
+	if err := reverseRows.Err(); err != nil {
+		return nil, fmt.Errorf("역방향 친구 반복 오류: %w", err)
+	}
+
+	// 4. Build response by combining forward and reverse data
+	var results []FriendsResponse
+	for _, f := range friends {
+		reverse, hasReverse := reverseMap[f.FriendUsername]
 
 		// Determine status string
 		var status string
+		reverseAreWeFriend := hasReverse && reverse.AreWeFriend
 		switch {
-		case areWeFriend && reverseAreWeFriend:
+		case f.AreWeFriend && reverseAreWeFriend:
 			status = "깐부"
-		case areWeFriend && !reverseAreWeFriend:
+		case f.AreWeFriend && !reverseAreWeFriend:
 			status = "깐부 요청 진행중"
-		case !areWeFriend && reverseAreWeFriend:
+		case !f.AreWeFriend && reverseAreWeFriend:
 			status = "깐부 요청 받음"
 		default:
 			status = "요청 거부"
 		}
 
+		fromSettings := FriendSettings{}
+		if hasReverse {
+			fromSettings = reverse.Settings
+		}
+
+		toSettings := f.Settings
 		resp := FriendsResponse{
-			FriendID:           friendID,
-			FriendUsername:     friendUsername,
+			FriendID:           f.FriendID,
+			FriendUsername:     f.FriendUsername,
 			AreWeFriend:        status,
-			NickName:           friendUsername,
-			Ordering:           ordering,
+			NickName:           f.FriendUsername,
+			Ordering:           f.Ordering,
 			CharacterList:      []interface{}{},
 			ToFriendSettings:   &toSettings,
 			FromFriendSettings: &fromSettings,
 		}
 		results = append(results, resp)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("친구 목록 반복 오류: %w", err)
 	}
 
 	if results == nil {
@@ -225,7 +313,7 @@ func (s *FriendService) GetFriends(ctx context.Context, username string) ([]Frie
 }
 
 // SearchCharacter searches for characters by name, excluding the requester.
-// Java: friendsService.findCharacter(username, characterName) returns List<FriendFindCharacterResponse>.
+// Optimized: Uses batch query to avoid N+1 problem.
 func (s *FriendService) SearchCharacter(ctx context.Context, username, characterName string) ([]FriendFindCharacterResponse, error) {
 	// 1. Get requester member ID
 	var memberID int64
@@ -234,15 +322,19 @@ func (s *FriendService) SearchCharacter(ctx context.Context, username, character
 		return nil, fmt.Errorf("회원을 찾을 수 없습니다: %w", err)
 	}
 
-	// 2. Query characters by exact name match, excluding requesting user
+	// 2. Query characters by exact name match with friendship status in one query using LEFT JOINs
 	query := `
 		SELECT DISTINCT m.member_id, m.username, c.character_name,
-		       (SELECT COUNT(*) FROM characters WHERE member_id = m.member_id AND is_deleted = false) as char_count
+		       (SELECT COUNT(*) FROM characters WHERE member_id = m.member_id AND is_deleted = false) as char_count,
+		       my_f.are_we_friend as my_are_we_friend,
+		       their_f.are_we_friend as their_are_we_friend
 		FROM characters c
 		JOIN member m ON c.member_id = m.member_id
+		LEFT JOIN friends my_f ON my_f.member_id = ? AND my_f.from_member = m.member_id
+		LEFT JOIN friends their_f ON their_f.member_id = m.member_id AND their_f.from_member = ?
 		WHERE c.character_name = ? AND m.username != ?
 	`
-	rows, err := s.db.QueryContext(ctx, query, characterName, username)
+	rows, err := s.db.QueryContext(ctx, query, memberID, memberID, characterName, username)
 	if err != nil {
 		return nil, fmt.Errorf("캐릭터 검색 실패: %w", err)
 	}
@@ -251,37 +343,20 @@ func (s *FriendService) SearchCharacter(ctx context.Context, username, character
 	var results []FriendFindCharacterResponse
 	for rows.Next() {
 		var resp FriendFindCharacterResponse
-		if err := rows.Scan(&resp.ID, &resp.Username, &resp.CharacterName, &resp.CharacterListSize); err != nil {
+		var myAreWeFriendRaw, theirAreWeFriendRaw []byte
+
+		if err := rows.Scan(&resp.ID, &resp.Username, &resp.CharacterName, &resp.CharacterListSize,
+			&myAreWeFriendRaw, &theirAreWeFriendRaw); err != nil {
 			return nil, fmt.Errorf("캐릭터 검색 스캔 실패: %w", err)
 		}
 
-		// 3. Check friend status with this member
-		// Check both directions of friendship
-		var myAreWeFriend, theirAreWeFriend sql.NullBool
-		var myRecordExists, theirRecordExists bool
+		// Determine friend status
+		myRecordExists := len(myAreWeFriendRaw) > 0
+		theirRecordExists := len(theirAreWeFriendRaw) > 0
 
-		// My record: I have them as friend
-		err := s.db.QueryRowContext(ctx,
-			"SELECT are_we_friend FROM friends WHERE member_id = ? AND from_member = ?",
-			memberID, resp.ID,
-		).Scan(&myAreWeFriend)
-		myRecordExists = err == nil
-
-		// Their record: They have me as friend
-		err = s.db.QueryRowContext(ctx,
-			"SELECT are_we_friend FROM friends WHERE member_id = ? AND from_member = ?",
-			resp.ID, memberID,
-		).Scan(&theirAreWeFriend)
-		theirRecordExists = err == nil
-
-		// Determine friend status based on Spring logic
-		// Spring isFriend() returns:
-		// - FRIEND_SEND ("깐부 요청") when no relationship exists (result.isEmpty())
-		// - FRIEND / FRIEND_PROGRESSING / FRIEND_RECEIVED / FRIEND_REJECT when relationship exists
 		if myRecordExists || theirRecordExists {
-			// Relationship exists - check details
-			toFriends := myRecordExists && myAreWeFriend.Bool
-			fromFriends := theirRecordExists && theirAreWeFriend.Bool
+			toFriends := myRecordExists && bitToBool(myAreWeFriendRaw)
+			fromFriends := theirRecordExists && bitToBool(theirAreWeFriendRaw)
 			switch {
 			case toFriends && fromFriends:
 				resp.AreWeFriend = "깐부"
@@ -293,7 +368,6 @@ func (s *FriendService) SearchCharacter(ctx context.Context, username, character
 				resp.AreWeFriend = "요청 거부"
 			}
 		} else {
-			// No relationship at all - can send friend request
 			resp.AreWeFriend = "깐부 요청"
 		}
 
@@ -579,20 +653,34 @@ func (s *FriendService) UpdateSettings(ctx context.Context, username string, req
 		return nil, fmt.Errorf("친구 설정 업데이트 실패: %w", err)
 	}
 
-	// Read back the full settings
-	var updated FriendSettings
+	// Read back the full settings (BIT fields)
+	var showDayTodo, showRaid, showWeekTodo       []byte
+	var checkDayTodo, checkRaid, checkWeekTodo    []byte
+	var updateGauge, updateRaid, settingRaw       []byte
 	err = s.db.QueryRowContext(ctx,
 		`SELECT show_day_todo, show_raid, show_week_todo,
 		        check_day_todo, check_raid, check_week_todo,
 		        update_gauge, update_raid, setting
 		 FROM friends WHERE friends_id = ?`, req.ID,
 	).Scan(
-		&updated.ShowDayTodo, &updated.ShowRaid, &updated.ShowWeekTodo,
-		&updated.CheckDayTodo, &updated.CheckRaid, &updated.CheckWeekTodo,
-		&updated.UpdateGauge, &updated.UpdateRaid, &updated.Setting,
+		&showDayTodo, &showRaid, &showWeekTodo,
+		&checkDayTodo, &checkRaid, &checkWeekTodo,
+		&updateGauge, &updateRaid, &settingRaw,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("설정 조회 실패: %w", err)
+	}
+
+	updated := FriendSettings{
+		ShowDayTodo:   bitToBool(showDayTodo),
+		ShowRaid:      bitToBool(showRaid),
+		ShowWeekTodo:  bitToBool(showWeekTodo),
+		CheckDayTodo:  bitToBool(checkDayTodo),
+		CheckRaid:     bitToBool(checkRaid),
+		CheckWeekTodo: bitToBool(checkWeekTodo),
+		UpdateGauge:   bitToBool(updateGauge),
+		UpdateRaid:    bitToBool(updateRaid),
+		Setting:       bitToBool(settingRaw),
 	}
 
 	return &updated, nil

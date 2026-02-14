@@ -22,18 +22,41 @@ const friendsColumns = `
 	update_gauge, update_raid, setting
 `
 
+// bitToBool converts MySQL BIT(1)/TINYINT(1) to bool
+func bitToBool(b []byte) bool {
+	return len(b) > 0 && b[0] == 1
+}
+
 func scanFriends(scanner interface{ Scan(dest ...interface{}) error }) (*Friends, error) {
 	f := &Friends{}
+	// MySQL BIT(1) fields need to be scanned as []byte first
+	var areWeFriend, showDayTodo, showRaid, showWeekTodo []byte
+	var checkDayTodo, checkRaid, checkWeekTodo []byte
+	var updateGauge, updateRaid, setting []byte
+
 	err := scanner.Scan(
-		&f.ID, &f.MemberID, &f.FromMember, &f.AreWeFriend, &f.Ordering,
+		&f.ID, &f.MemberID, &f.FromMember, &areWeFriend, &f.Ordering,
 		&f.CreatedDate, &f.LastModifiedDate,
-		&f.ShowDayTodo, &f.ShowRaid, &f.ShowWeekTodo,
-		&f.CheckDayTodo, &f.CheckRaid, &f.CheckWeekTodo,
-		&f.UpdateGauge, &f.UpdateRaid, &f.Setting,
+		&showDayTodo, &showRaid, &showWeekTodo,
+		&checkDayTodo, &checkRaid, &checkWeekTodo,
+		&updateGauge, &updateRaid, &setting,
 	)
 	if err != nil {
 		return nil, err
 	}
+
+	// Convert BIT fields to bool
+	f.AreWeFriend = bitToBool(areWeFriend)
+	f.ShowDayTodo = bitToBool(showDayTodo)
+	f.ShowRaid = bitToBool(showRaid)
+	f.ShowWeekTodo = bitToBool(showWeekTodo)
+	f.CheckDayTodo = bitToBool(checkDayTodo)
+	f.CheckRaid = bitToBool(checkRaid)
+	f.CheckWeekTodo = bitToBool(checkWeekTodo)
+	f.UpdateGauge = bitToBool(updateGauge)
+	f.UpdateRaid = bitToBool(updateRaid)
+	f.Setting = bitToBool(setting)
+
 	return f, nil
 }
 

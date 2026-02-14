@@ -128,10 +128,57 @@ func (s *CharacterWeekService) verifyCharacterOwnership(ctx context.Context, use
 }
 
 // AddRemoveWeekRaid adds or removes week raids for a character.
+// Optimized: Uses batch query to avoid N+1 problem.
 func (s *CharacterWeekService) AddRemoveWeekRaid(ctx context.Context, username string, req WeekRaidRequest) error {
 	_, err := s.verifyCharacterOwnership(ctx, username, req.CharacterID)
 	if err != nil {
 		return err
+	}
+
+	if len(req.WeekContentIDList) == 0 {
+		// Just delete all raids
+		_, err = s.db.ExecContext(ctx, "DELETE FROM todov2 WHERE character_id = ?", req.CharacterID)
+		return err
+	}
+
+	// Batch query: Load all week content data in one query
+	query := `SELECT content_id, week_category, name, COALESCE(gate, 0),
+	                 COALESCE(gold, 0), COALESCE(level, 0)
+	          FROM content WHERE content_id IN (`
+	args := make([]interface{}, len(req.WeekContentIDList))
+	for i, id := range req.WeekContentIDList {
+		if i > 0 {
+			query += ","
+		}
+		query += "?"
+		args[i] = id
+	}
+	query += ") AND dtype = 'WeekContent'"
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return fmt.Errorf("batch querying week content: %w", err)
+	}
+	defer rows.Close()
+
+	type contentInfo struct {
+		contentID    int64
+		weekCategory string
+		name         string
+		gate         int
+		gold         float64
+		level        float64
+	}
+	contentMap := make(map[int64]contentInfo)
+	for rows.Next() {
+		var c contentInfo
+		if err := rows.Scan(&c.contentID, &c.weekCategory, &c.name, &c.gate, &c.gold, &c.level); err != nil {
+			return fmt.Errorf("scanning week content: %w", err)
+		}
+		contentMap[c.contentID] = c
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating week content: %w", err)
 	}
 
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -148,32 +195,12 @@ func (s *CharacterWeekService) AddRemoveWeekRaid(ctx context.Context, username s
 		return fmt.Errorf("deleting existing raids: %w", err)
 	}
 
-	// Add new raids from week content list
+	// Add new raids from week content list using preloaded data
 	now := time.Now()
 	for i, contentID := range req.WeekContentIDList {
-		var weekCategory, weekContentName string
-		var weekContentGate int
-		var gold, itemLevel float64
-
-		err := s.db.QueryRowContext(ctx,
-			`SELECT week_category, name, COALESCE(gate, 0),
-			        COALESCE(gold, 0), COALESCE(level, 0)
-			 FROM content WHERE content_id = ? AND dtype = 'WeekContent'`, contentID,
-		).Scan(&weekCategory, &weekContentName, &weekContentGate, &gold, &itemLevel)
-		if err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				continue
-			}
-			return fmt.Errorf("querying week content %d: %w", contentID, err)
-		}
-
-		// Count total gates for this category
-		var totalGate int
-		err = s.db.QueryRowContext(ctx,
-			"SELECT COUNT(*) FROM content WHERE week_category = ? AND dtype = 'WeekContent'", weekCategory,
-		).Scan(&totalGate)
-		if err != nil {
-			totalGate = 1
+		content, exists := contentMap[contentID]
+		if !exists {
+			continue
 		}
 
 		_, err = tx.ExecContext(ctx,
@@ -183,7 +210,7 @@ func (s *CharacterWeekService) AddRemoveWeekRaid(ctx context.Context, username s
 			 created_date, last_modified_date)
 			 VALUES (?, ?, ?, false, false, ?, 0, 1, false, ?, ?)`,
 			req.CharacterID, contentID,
-			gold, i,
+			content.gold, i,
 			now, now,
 		)
 		if err != nil {
