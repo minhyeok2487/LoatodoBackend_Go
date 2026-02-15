@@ -247,11 +247,14 @@ func (s *CommunityService) CreatePost(ctx context.Context, username string, req 
 		return nil, fmt.Errorf("캐릭터 조회 실패: %w", err)
 	}
 
+	// Generate anonymous name like Spring: "익명의 {characterClassName} {memberId}"
+	anonymousName := fmt.Sprintf("익명의 %s %d", characterClassName, memberID)
+
 	now := time.Now()
 	result, err := s.db.ExecContext(ctx,
 		`INSERT INTO community (member_id, name, body, category, root_parent_id, comment_parent_id, deleted, show_name, created_date, last_modified_date)
 		 VALUES (?, ?, ?, ?, 0, 0, false, true, ?, ?)`,
-		memberID, req.Title, req.Body, req.Category, now, now,
+		memberID, anonymousName, req.Body, req.Category, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("게시글 생성 실패: %w", err)
@@ -267,7 +270,7 @@ func (s *CommunityService) CreatePost(ctx context.Context, username string, req 
 		CreatedDate:        now.Format("2006-01-02T15:04:05.000000"),
 		CharacterClassName: characterClassName,
 		CharacterImage:     characterImage,
-		Name:               req.Title,
+		Name:               anonymousName,
 		MemberID:           memberID,
 		Body:               req.Body,
 		Category:           req.Category,
