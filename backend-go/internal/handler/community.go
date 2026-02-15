@@ -70,7 +70,17 @@ func (h *CommunityHandler) GetPost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "post not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, post)
+	// Get comments for this post
+	comments, err := h.svc.GetComments(r.Context(), username, communityID)
+	if err != nil {
+		comments = []service.CommunityCommentResponse{}
+	}
+	// Return in Spring format: { community: {...}, comments: [...] }
+	response := map[string]interface{}{
+		"community": post,
+		"comments":  comments,
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 // CreatePost handles POST /api/v1/community
