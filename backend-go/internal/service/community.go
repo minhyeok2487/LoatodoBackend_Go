@@ -38,9 +38,12 @@ type CommunityListResponse struct {
 }
 
 type CreateCommunityRequest struct {
-	Category string `json:"category"`
-	Title    string `json:"title"`
-	Body     string `json:"body"`
+	Category        string  `json:"category"`
+	Body            string  `json:"body"`
+	ShowName        bool    `json:"showName"`
+	ImageList       []int64 `json:"imageList"`
+	RootParentID    int64   `json:"rootParentId"`
+	CommentParentID int64   `json:"commentParentId"`
 }
 
 type UpdateCommunityRequest struct {
@@ -229,32 +232,50 @@ func (s *CommunityService) GetPost(ctx context.Context, username string, communi
 }
 
 func (s *CommunityService) CreatePost(ctx context.Context, username string, req CreateCommunityRequest) (*CommunityPostResponse, error) {
-	// Get member ID and character info
+	// Get member ID and main character name
 	var memberID int64
-	err := s.db.QueryRowContext(ctx, "SELECT member_id FROM member WHERE username = ?", username).Scan(&memberID)
+	var mainCharacterName sql.NullString
+	err := s.db.QueryRowContext(ctx,
+		"SELECT member_id, main_character FROM member WHERE username = ?",
+		username).Scan(&memberID, &mainCharacterName)
 	if err != nil {
 		return nil, fmt.Errorf("회원을 찾을 수 없습니다: %w", err)
 	}
 
-	// Get character info
+	// Get main character info (like Spring: filter by mainCharacterName)
 	var characterClassName, characterImage string
-	err = s.db.QueryRowContext(ctx,
-		`SELECT COALESCE(character_class_name, ''), COALESCE(character_image, '')
-		 FROM characters WHERE member_id = ? AND (is_deleted IS NULL OR is_deleted = false)
-		 ORDER BY sort_number LIMIT 1`,
-		memberID).Scan(&characterClassName, &characterImage)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, fmt.Errorf("캐릭터 조회 실패: %w", err)
+	if mainCharacterName.Valid && mainCharacterName.String != "" {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(character_class_name, ''), COALESCE(character_image, '')
+			 FROM characters WHERE member_id = ? AND character_name = ? AND (is_deleted IS NULL OR is_deleted = false)`,
+			memberID, mainCharacterName.String).Scan(&characterClassName, &characterImage)
+	}
+	// Fallback to first character if main not found
+	if characterClassName == "" {
+		err = s.db.QueryRowContext(ctx,
+			`SELECT COALESCE(character_class_name, ''), COALESCE(character_image, '')
+			 FROM characters WHERE member_id = ? AND (is_deleted IS NULL OR is_deleted = false)
+			 ORDER BY sort_number LIMIT 1`,
+			memberID).Scan(&characterClassName, &characterImage)
+		if err != nil && err != sql.ErrNoRows {
+			return nil, fmt.Errorf("캐릭터 조회 실패: %w", err)
+		}
 	}
 
-	// Generate anonymous name like Spring: "익명의 {characterClassName} {memberId}"
-	anonymousName := fmt.Sprintf("익명의 %s %d", characterClassName, memberID)
+	// Generate name based on showName (like Spring)
+	// showName=true: use mainCharacterName, showName=false: "익명의 {class} {memberId}"
+	var name string
+	if req.ShowName && mainCharacterName.Valid && mainCharacterName.String != "" {
+		name = mainCharacterName.String
+	} else {
+		name = fmt.Sprintf("익명의 %s %d", characterClassName, memberID)
+	}
 
 	now := time.Now()
 	result, err := s.db.ExecContext(ctx,
-		`INSERT INTO community (member_id, name, body, category, root_parent_id, comment_parent_id, deleted, show_name, created_date, last_modified_date)
-		 VALUES (?, ?, ?, ?, 0, 0, false, true, ?, ?)`,
-		memberID, anonymousName, req.Body, req.Category, now, now,
+		`INSERT INTO community (member_id, character_image, character_class_name, name, show_name, body, category, root_parent_id, comment_parent_id, deleted, created_date, last_modified_date)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, false, ?, ?)`,
+		memberID, characterImage, characterClassName, name, req.ShowName, req.Body, req.Category, req.RootParentID, req.CommentParentID, now, now,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("게시글 생성 실패: %w", err)
@@ -270,7 +291,7 @@ func (s *CommunityService) CreatePost(ctx context.Context, username string, req 
 		CreatedDate:        now.Format("2006-01-02T15:04:05.000000"),
 		CharacterClassName: characterClassName,
 		CharacterImage:     characterImage,
-		Name:               anonymousName,
+		Name:               name,
 		MemberID:           memberID,
 		Body:               req.Body,
 		Category:           req.Category,
